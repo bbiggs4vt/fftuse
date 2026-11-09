@@ -178,6 +178,18 @@ for v in "${VARIANTS[@]}"; do
 		--csv "$OUT/results.csv" --label "collect $v" | tee "$OUT/bench-$v-warm.txt"
 done
 
+# Does FFTW_MEASURE pick good plans here? Compares Estimate and Measure plans
+# timed alone and inside CFftV4's per-segment loop (which uses each variant's
+# kernels). About 20-60 seconds per variant.
+for v in "${VARIANTS[@]}"; do
+	if [ -x "$BUILD-$v/fft_plan_check" ]; then
+		log "FFTW plan check ($v)"
+		${PIN[@]+"${PIN[@]}"} "$BUILD-$v/fft_plan_check" --sizes "$WISDOM_SIZES" --details > "$OUT/plan-check-$v.txt" 2>&1 || true
+		# The table and verdicts; the full plans are in the file
+		grep -v '^ *(' "$OUT/plan-check-$v.txt" | grep -v '^  --- ' | grep -v '^$' || true
+	fi
+done
+
 # Temperatures after the run show whether the board throttled
 {
 	echo "--- thermal zones after benchmarks (millidegrees C)"
