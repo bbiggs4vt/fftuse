@@ -147,11 +147,27 @@ flushes denormals to zero. The option applies `-mfpu=neon
 -funsafe-math-optimizations` to `FftV4Kernels.cpp` only. That file holds the four
 per-sample loops: window, accumulate, and the two passes of dB conversion.
 Everything else, including the window setup and FFTW planning in the constructor,
-keeps strict IEEE semantics. In your own build system, give `FftV4Kernels.cpp`
-those two flags. Use `-funsafe-math-optimizations`, not `-ffast-math`: the latter
-implies finite-only math, which lets the compiler drop the NaN and infinity
-handling in the dB conversion. The binary then needs a CPU with NEON. The A8 has
-it; a few A9s, such as Tegra 2, don't.
+keeps strict IEEE semantics. Use `-funsafe-math-optimizations`, not
+`-ffast-math`: the latter implies finite-only math, which lets the compiler drop
+the NaN and infinity handling in the dB conversion. The binary then needs a CPU
+with NEON. The A8 has it; a few A9s, such as Tegra 2, don't.
+
+**Watch the optimization level.** At `-O2`, the default in Yocto and many distro
+builds, GCC 13 leaves all four kernel loops scalar even with the flags above. Its
+`-O2` vectorizer uses a "very cheap" cost model that rejects them. Build
+`FftV4Kernels.cpp` with `-O3`, or add `-ftree-vectorize -fvect-cost-model=dynamic`.
+This project's CMake adds the latter to that file automatically on every
+platform, whatever the build type. In a Yocto build for a Cortex-A9, whose tune
+already supplies `-mfpu=neon -mcpu=cortex-a9`, give `FftV4Kernels.cpp`:
+
+```
+-funsafe-math-optimizations -ftree-vectorize -fvect-cost-model=dynamic
+```
+
+This was checked with the board's exact Yocto flags (`-mfpu=neon -mfloat-abi=hard
+-mcpu=cortex-a9 -fstack-protector-strong -O2 -D_FORTIFY_SOURCE=2`). Without the
+extra flags none of the four loops vectorize; with them all four do. All 758 test
+checks pass with them under QEMU as a Cortex-A9.
 
 Scoping the flag to the kernels matters. The first attempt applied it to all of
 `FftV4.cpp`, and the N=2 window broke. A symmetric Blackman window is exactly zero
@@ -218,6 +234,30 @@ wisdom:
   wisdom file, and don't ship wisdom files. FFTW's measured plans do use NEON
   codelets (`n1fv_*_neon`, `t2fv_*_neon`), so this isn't a fall-back to scalar code.
   `tools/fft_plan_check` (below) tells apart the two likely causes.
+
+  **The plan check on the board** (second run, same setup) found bad measurements
+  in all 8 cases: both builds, both sizes, and both layouts. Measure plans took
+  1.21–1.35x of the Estimate plan's time when timed alone, and 1.17–1.27x in the
+  loop. Measure also picked the same plan in every repeat, so the choice is
+  consistently wrong rather than noisy. Its plans use `t2fv` twiddle codelets,
+  which read every twiddle factor from a table, inside a looped `n1fv_128`. The
+  Estimate plans use `t3fv`, which read fewer twiddles and compute the rest. A
+  plausible but unproven explanation: FFTW times sub-transforms alone with warm
+  caches, which on a 32 KB L1 and slow memory keeps favoring the table-heavy
+  pieces.
+
+  The board's FFTW comes from Yocto's recipe, configured with
+  `--enable-shared --enable-threads --disable-fortran` (plus the single-precision
+  and NEON options, as `fftw-3.3.10-neon` shows) and built with `-O2 -mcpu=cortex-a9
+  -mfpu=neon`. It has no cycle counter (`--enable-armv7a-pmccntr`), so FFTW times
+  candidates with a coarse clock. On its own, a coarse clock would more likely give
+  noisy picks than this consistent one. Adding the counter would also need kernel
+  support for user-space PMU access, so it isn't worth pursuing: use Estimate.
+  To check another FFTW library for the cycle counter:
+
+  ```
+  objdump -d libfftw3f.so.3 | grep -c 'mrc.*15, 0, .*cr9, cr13, {0}'   # 0 = no counter
+  ```
 
 ## Behavior changes in v2
 
