@@ -5,6 +5,13 @@
 #   bench/collect.sh                 # full run (about 5-15 minutes, depending on the machine)
 #   bench/collect.sh --quick         # smaller grid, about 1-3 minutes
 #   bench/collect.sh --name pi5      # name used in the CSV and the archive (default: host name)
+#   bench/collect.sh --sizes 1024,4096   # only these FFT sizes (use the sizes your application uses)
+#   bench/collect.sh --no-neon-variant   # on 32-bit ARM, skip the second build (see below)
+#
+# On 32-bit ARM with NEON (e.g. Cortex-A8/A9), it builds and benchmarks twice:
+# with the toolchain's default flags, and with -DFFT_ARMV7_NEON=ON (CFftV4's
+# kernels built with -mfpu=neon -funsafe-math-optimizations). The two runs are
+# told apart by the build column in results.csv.
 #
 # Environment:
 #   BENCH_CPU=<n>     pin the benchmark to this CPU (default: the fastest core, if taskset exists)
@@ -18,11 +25,15 @@ set -euo pipefail
 
 QUICK=0
 NAME=""
+SIZES=""
+NEON_VARIANT=auto
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--quick) QUICK=1 ;;
 		--name) NAME="$2"; shift ;;
-		-h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+		--sizes) SIZES="$2"; shift ;;
+		--no-neon-variant) NEON_VARIANT=no ;;
+		-h|--help) sed -n '2,24p' "$0"; exit 0 ;;
 		*) echo "unknown option $1"; exit 2 ;;
 	esac
 	shift
@@ -73,22 +84,46 @@ log "System information"
 } > "$OUT/system.txt" 2>&1
 cat "$OUT/system.txt" | head -8
 
-log "Build (Release)"
-# shellcheck disable=SC2086
-cmake -S "$ROOT" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release ${CMAKE_ARGS:-} > "$OUT/build.log" 2>&1
-cmake --build "$BUILD" -j "$JOBS" >> "$OUT/build.log" 2>&1 || { tail -30 "$OUT/build.log"; echo "build failed; see $OUT/build.log"; exit 1; }
-"$BUILD/fft_bench" --info --machine "$NAME" | tee "$OUT/machine.txt"
+# Build variants: name and extra CMake arguments
+VARIANTS=("default")
+VARIANT_ARGS=("")
+case "$(uname -m)" in
+	armv6*|armv7*|armv8l|arm)
+		if [ "$NEON_VARIANT" = auto ] && grep -qiw neon /proc/cpuinfo 2>/dev/null; then
+			VARIANTS+=("neon-kernels")
+			VARIANT_ARGS+=("-DFFT_ARMV7_NEON=ON")
+		fi
+		;;
+esac
 
-log "Correctness tests"
+build_variant() { # name extra-args
+	local dir="$BUILD-$1"
+	log "Build ($1, Release)"
+	# shellcheck disable=SC2086
+	cmake -S "$ROOT" -B "$dir" -DCMAKE_BUILD_TYPE=Release $2 ${CMAKE_ARGS:-} > "$OUT/build-$1.log" 2>&1 &&
+	cmake --build "$dir" -j "$JOBS" >> "$OUT/build-$1.log" 2>&1 || { tail -30 "$OUT/build-$1.log"; echo "build $1 failed; see $OUT/build-$1.log"; exit 1; }
+}
+
 TESTS_OK=1
-if ! "$BUILD/fft_tests" > "$OUT/tests.log" 2>&1; then
-	TESTS_OK=0
-	echo "TESTS FAILED (benchmarks still run; failures are in tests.log):"
-	grep FAIL "$OUT/tests.log" | head -20
-fi
-tail -1 "$OUT/tests.log"
-if [ -x "$BUILD/v1_bug_repro" ]; then
-	"$BUILD/v1_bug_repro" > "$OUT/v1_bug_repro.log" 2>&1 || true
+test_variant() { # name
+	local dir="$BUILD-$1"
+	log "Correctness tests ($1)"
+	if ! "$dir/fft_tests" > "$OUT/tests-$1.log" 2>&1; then
+		TESTS_OK=0
+		echo "TESTS FAILED for $1 (benchmarks still run; failures are in tests-$1.log):"
+		grep FAIL "$OUT/tests-$1.log" | head -20
+	fi
+	tail -1 "$OUT/tests-$1.log"
+}
+
+for i in "${!VARIANTS[@]}"; do
+	build_variant "${VARIANTS[$i]}" "${VARIANT_ARGS[$i]}"
+	test_variant "${VARIANTS[$i]}"
+done
+FIRST="$BUILD-${VARIANTS[0]}"
+"$FIRST/fft_bench" --info --machine "$NAME" | tee "$OUT/machine.txt"
+if [ -x "$FIRST/v1_bug_repro" ]; then
+	"$FIRST/v1_bug_repro" > "$OUT/v1_bug_repro.log" 2>&1 || true
 fi
 
 # Pin to one CPU so the scheduler doesn't move the benchmark between cores. On
@@ -111,25 +146,29 @@ if command -v taskset >/dev/null; then
 fi
 
 if [ "$QUICK" = 1 ]; then
-	GRID=(--sizes 256,1024,4096,16384 --bins-div 1 --min-time 30 --samples 5)
-	WISDOM_SIZES=256,1024,4096,16384
+	GRID=(--bins-div 1 --min-time 30 --samples 5)
+	WISDOM_SIZES="${SIZES:-256,1024,4096,16384}"
 	IMPLS="v2*,v3,v4*"
 else
 	GRID=()
-	WISDOM_SIZES=256,1024,4096,16384,65536
+	WISDOM_SIZES="${SIZES:-256,1024,4096,16384,65536}"
 	IMPLS="v2*,v3*,v4*"
 fi
+GRID+=(--sizes "$WISDOM_SIZES")
 
+# Wisdom belongs to FFTW, which both variants share
 log "Generate FFTW wisdom (v2 and v4 shapes)"
-${PIN[@]+"${PIN[@]}"} "$BUILD/fft_wisdom" -o "$OUT/fftwf.wisdom" --class v2,v4 --sizes "$WISDOM_SIZES" | tee "$OUT/wisdom.log"
+${PIN[@]+"${PIN[@]}"} "$FIRST/fft_wisdom" -o "$OUT/fftwf.wisdom" --class v2,v4 --sizes "$WISDOM_SIZES" | tee "$OUT/wisdom.log"
 
-log "Benchmark, cold (no wisdom)"
-${PIN[@]+"${PIN[@]}"} "$BUILD/fft_bench" --machine "$NAME" --only "$IMPLS" ${GRID[@]+"${GRID[@]}"} \
-	--csv "$OUT/results.csv" --label "collect cold" | tee "$OUT/bench-cold.txt"
+for v in "${VARIANTS[@]}"; do
+	log "Benchmark $v, cold (no wisdom)"
+	${PIN[@]+"${PIN[@]}"} "$BUILD-$v/fft_bench" --machine "$NAME" --only "$IMPLS" "${GRID[@]}" \
+		--csv "$OUT/results.csv" --label "collect $v cold" | tee "$OUT/bench-$v-cold.txt"
 
-log "Benchmark, warm (wisdom loaded)"
-${PIN[@]+"${PIN[@]}"} "$BUILD/fft_bench" --machine "$NAME" --only "$IMPLS" ${GRID[@]+"${GRID[@]}"} --wisdom "$OUT/fftwf.wisdom" \
-	--csv "$OUT/results.csv" --label "collect" | tee "$OUT/bench-warm.txt"
+	log "Benchmark $v, warm (wisdom loaded)"
+	${PIN[@]+"${PIN[@]}"} "$BUILD-$v/fft_bench" --machine "$NAME" --only "$IMPLS" "${GRID[@]}" --wisdom "$OUT/fftwf.wisdom" \
+		--csv "$OUT/results.csv" --label "collect $v" | tee "$OUT/bench-$v-warm.txt"
+done
 
 # Temperatures after the run show whether the board throttled
 {

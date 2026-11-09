@@ -22,6 +22,9 @@
 #ifndef FFT_CXX_FLAGS
 #define FFT_CXX_FLAGS "unknown"
 #endif
+#ifndef FFT_V4_KERNEL_FLAGS
+#define FFT_V4_KERNEL_FLAGS ""
+#endif
 
 struct MachineInfo
 {
@@ -121,7 +124,9 @@ inline std::string ArmPartName(const std::string& implementer, const std::string
 		{ "0x41", "0xd4f", "Neoverse-V2" }, { "0x41", "0xd80", "Cortex-A520" },
 		{ "0x41", "0xd81", "Cortex-A720" }, { "0x41", "0xd82", "Cortex-X4" },
 		{ "0x41", "0xd84", "Neoverse-V3" }, { "0x41", "0xd8e", "Neoverse-N3" },
-		{ "0x41", "0xc07", "Cortex-A7" }, { "0x41", "0xc09", "Cortex-A9" },
+		{ "0x41", "0xc07", "Cortex-A7" }, { "0x41", "0xc08", "Cortex-A8" },
+		{ "0x41", "0xc09", "Cortex-A9" }, { "0x41", "0xc0d", "Cortex-A12" },
+		{ "0x41", "0xc0e", "Cortex-A17" },
 		{ "0x41", "0xc0f", "Cortex-A15" },
 		{ "0x4e", "0x004", "NVIDIA Carmel" }, { "0x61", "0x022", "Apple M1" },
 		{ "0xc0", "0xac3", "Ampere-1" }, { "0x51", "0x805", "Kryo 4xx Silver" },
@@ -174,8 +179,13 @@ inline std::string DetectCpu()
 		arm = parts;
 	}
 	std::string result = !lscpu.empty() && lscpu != "-" ? lscpu : arm;
-	// Boards often name themselves (Raspberry Pi, Jetson, ...)
-	const std::string board = ReadFirstLine("/proc/device-tree/model");
+	// Boards often name themselves (Raspberry Pi, BeagleBone, Jetson, ...). Older
+	// ARM kernels without a device tree report it in /proc/cpuinfo instead.
+	std::string board = ReadFirstLine("/proc/device-tree/model");
+	if (board.empty())
+	{
+		board = CpuInfoField("Hardware");
+	}
 	if (!board.empty())
 	{
 		result += (result.empty() ? "" : " on ") + board;
@@ -304,6 +314,13 @@ inline MachineInfo DetectMachine(const std::string& label)
 	m.governor = DetectGovernor(CurrentCpu());
 	m.compiler = DetectCompiler();
 	m.build = std::string(FFT_BUILD_TYPE) + " " + Trim(FFT_CXX_FLAGS);
+	// Extra flags for CFftV4's kernels (FFT_ARMV7_NEON). This TU isn't built with
+	// them, so the simd field below can't see them.
+	const std::string kernelFlags = Trim(FFT_V4_KERNEL_FLAGS);
+	if (!kernelFlags.empty())
+	{
+		m.build += "; v4 kernels: " + kernelFlags;
+	}
 	m.simd = DetectSimd();
 	m.fftw = Trim(fftwf_version);
 	return m;

@@ -302,6 +302,11 @@ int main(int argc, char** argv)
 	std::printf("cpu:      %s (%s, %u threads, governor %s)\n", mi.cpu.c_str(), mi.arch.c_str(), mi.cores, mi.governor.c_str());
 	std::printf("compiler: %s, %s, simd %s\n", mi.compiler.c_str(), mi.build.c_str(), mi.simd.c_str());
 	std::printf("fftw:     %s\n", mi.fftw.c_str());
+	if ((mi.arch == "arm32" || mi.arch == "aarch64") && mi.fftw.find("neon") == std::string::npos)
+	{
+		std::printf("note:     FFTW was built without NEON; the FFT is most of the run time, so an FFTW\n"
+			"          configured with --enable-float --enable-neon is likely the biggest speedup here\n");
+	}
 	if (mi.governor != "performance" && mi.governor != "unknown")
 	{
 		std::printf("note:     CPU governor is '%s'; results vary more than with 'performance'\n", mi.governor.c_str());

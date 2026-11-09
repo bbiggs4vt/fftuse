@@ -18,10 +18,32 @@ find_path(BOOST_INCLUDE_DIR boost/shared_ptr.hpp HINTS ${FFT_DEP_HINTS} PATH_SUF
 # compat/ holds stand-ins for stdafx.h and dsp::utility::CFftwPlanLock
 set(FFT_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/compat ${FFTW_INCLUDE_DIR} ${BOOST_INCLUDE_DIR})
 
+# std::mutex needs libpthread on older glibc (common on embedded ARM distros).
+# libm covers a static libfftw3f.a, e.g. a self-built NEON FFTW.
+find_package(Threads REQUIRED)
+set(FFT_LINK_LIBS ${FFTWF_LIBRARY} Threads::Threads)
+if(UNIX AND NOT APPLE)
+  list(APPEND FFT_LINK_LIBS m)
+endif()
+
+# 32-bit ARM (ARMv7: Cortex-A8/A9/...): GCC only vectorizes float loops for NEON
+# with -funsafe-math-optimizations. This applies it, plus -mfpu=neon, to CFftV4's
+# kernels only (FftV4Kernels.cpp); everything else keeps the toolchain's flags.
+# The resulting binary needs a CPU with NEON. See FftV4Kernels.h.
+option(FFT_ARMV7_NEON "Build CFftV4's kernels with -mfpu=neon -funsafe-math-optimizations (32-bit ARM)" OFF)
+set(FFT_V4_KERNEL_FLAGS "")
+if(FFT_ARMV7_NEON)
+  set(FFT_V4_KERNEL_FLAGS -mfpu=neon -funsafe-math-optimizations)
+  set_source_files_properties(FftV4Kernels.cpp PROPERTIES COMPILE_OPTIONS "${FFT_V4_KERNEL_FLAGS}")
+endif()
+string(REPLACE ";" " " FFT_V4_KERNEL_FLAGS_TEXT "${FFT_V4_KERNEL_FLAGS}")
+
+set(FFT_SOURCES Fft.cpp FftV2.cpp FftV3.cpp FftV4.cpp FftV4Kernels.cpp FftwWisdom.cpp)
+
 function(fft_lib name)
-  add_library(${name} STATIC Fft.cpp FftV2.cpp FftV3.cpp FftV4.cpp FftwWisdom.cpp)
+  add_library(${name} STATIC ${FFT_SOURCES})
   target_include_directories(${name} PUBLIC ${FFT_INCLUDES})
-  target_link_libraries(${name} PUBLIC ${FFTWF_LIBRARY})
+  target_link_libraries(${name} PUBLIC ${FFT_LINK_LIBS})
 endfunction()
 
 fft_lib(fftlib)
@@ -35,7 +57,8 @@ target_link_libraries(fft_bench PRIVATE fftlib)
 string(TOUPPER "${CMAKE_BUILD_TYPE}" FFT_BUILD_TYPE_UPPER)
 target_compile_definitions(fft_bench PRIVATE
   "FFT_BUILD_TYPE=\"${CMAKE_BUILD_TYPE}\""
-  "FFT_CXX_FLAGS=\"${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${FFT_BUILD_TYPE_UPPER}}\"")
+  "FFT_CXX_FLAGS=\"${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${FFT_BUILD_TYPE_UPPER}}\""
+  "FFT_V4_KERNEL_FLAGS=\"${FFT_V4_KERNEL_FLAGS_TEXT}\"")
 
 add_executable(fft_wisdom tools/fft_wisdom.cpp)
 target_link_libraries(fft_wisdom PRIVATE fftlib)
@@ -62,11 +85,11 @@ if(NOT WIN32)
     endif()
   endif()
   if(FFT_BUILD_REPRO)
-    add_library(fftlib_san STATIC Fft.cpp FftV2.cpp FftV3.cpp FftV4.cpp FftwWisdom.cpp)
+    add_library(fftlib_san STATIC ${FFT_SOURCES})
     target_include_directories(fftlib_san PUBLIC ${FFT_INCLUDES})
     target_compile_options(fftlib_san PUBLIC ${SAN} -O1)
     target_link_options(fftlib_san PUBLIC ${SAN})
-    target_link_libraries(fftlib_san PUBLIC ${FFTWF_LIBRARY})
+    target_link_libraries(fftlib_san PUBLIC ${FFT_LINK_LIBS})
     add_executable(v1_bug_repro tests/v1_bug_repro.cpp)
     target_link_libraries(v1_bug_repro PRIVATE fftlib_san)
   endif()

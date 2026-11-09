@@ -6,6 +6,7 @@
 | `FftV2.h` / `FftV2.cpp` | `CFftV2` | Bug fixes and the first speedups |
 | `FftV3.h` / `FftV3.cpp` | `CFftV3` | Experiment: batched segments with `fftwf_plan_many_dft`. Not faster; kept for the record |
 | `FftV4.h` / `FftV4.cpp` | `CFftV4` | Fastest: out-of-place FFT and vectorized dB conversion. Use this one |
+| `FftV4Kernels.h` / `FftV4Kernels.cpp` | (internal) | CFftV4's per-sample loops, in their own file so they can get NEON / unsafe-math flags on 32-bit ARM |
 | `FftwWisdom.h` / `FftwWisdom.cpp` | `FftwWisdom::*`, `CFftwWisdomFile` | Save and load FFTW wisdom so measured plans are instant (works with v2–v4) |
 | `tools/fft_wisdom.cpp` | | Command-line tool that generates a wisdom file |
 
@@ -61,6 +62,7 @@ On the target machine, from a checkout:
 ```
 bench/collect.sh --name <machine>           # full run, about 5–15 minutes
 bench/collect.sh --name <machine> --quick   # about 1–3 minutes
+bench/collect.sh --name <machine> --sizes 1024,4096   # only the sizes you care about
 ```
 
 It produces `bench-results-<machine>-<timestamp>.tar.gz`. Send that file back. The
@@ -111,9 +113,69 @@ so this checks correctness only:
 
 Not checked: real ARM timings, and detecting the CPU model on real ARM hardware.
 
-On **32-bit ARM (ARMv7)**, GCC doesn't auto-vectorize float loops for NEON without
-`-funsafe-math-optimizations`, because ARMv7 NEON isn't fully IEEE-compliant. The
-code still runs correctly there, but v4's kernels run scalar, so expect smaller gains.
+### 32-bit ARM (ARMv7, e.g. Cortex-A8)
+
+Two things matter much more on an ARMv7 core like the Cortex-A8 than elsewhere. Its
+scalar floating-point unit ("VFPLite") isn't pipelined, so plain float code is
+slow, and NEON is where the throughput is.
+
+**1. FFTW built with NEON (likely the biggest win).** The FFT is 70–80% of the
+time. Distribution armhf packages target a baseline without NEON. Ubuntu 24.04's
+`libfftw3-dev:armhf`, for example, reports plain `fftw-3.3.10`, with no `-neon`,
+so its FFT runs entirely on the scalar FPU. The `fftw` field in `--info` and in
+the CSV shows what your FFTW was built with, and `fft_bench` prints a note when
+it lacks NEON. To build one:
+
+```
+./configure --enable-float --enable-neon --disable-fortran \
+    CFLAGS="-O3 -mcpu=cortex-a8 -mfpu=neon -mfloat-abi=hard"
+make && make install          # then point CMake at it with -DCMAKE_PREFIX_PATH=<prefix>
+```
+
+Add `--host=arm-linux-gnueabihf` to cross-compile. Wisdom files are per FFTW
+build, so regenerate them after switching.
+
+**2. CFftV4's kernels with NEON:** `-DFFT_ARMV7_NEON=ON`. On ARMv7, GCC vectorizes
+float loops for NEON only with `-funsafe-math-optimizations`, because ARMv7 NEON
+flushes denormals to zero. The option applies `-mfpu=neon
+-funsafe-math-optimizations` to `FftV4Kernels.cpp` only. That file holds the four
+per-sample loops: window, accumulate, and the two passes of dB conversion.
+Everything else, including the window setup and FFTW planning in the constructor,
+keeps strict IEEE semantics. In your own build system, give `FftV4Kernels.cpp`
+those two flags. Use `-funsafe-math-optimizations`, not `-ffast-math`: the latter
+implies finite-only math, which lets the compiler drop the NaN and infinity
+handling in the dB conversion. The binary then needs a CPU with NEON. The A8 has
+it; a few A9s, such as Tegra 2, don't.
+
+Scoping the flag to the kernels matters. The first attempt applied it to all of
+`FftV4.cpp`, and the N=2 window broke. A symmetric Blackman window is exactly zero
+at both points for N=2, so v1 and v2 normalize round-off (about -1.4e-17 per
+sample). Unsafe math is allowed to turn that round-off into an exact 0, giving
+0/0. The kernels now live in their own file, and v4 handles N=2 explicitly with
+the rectangular window v1 and v2 end up with.
+
+`bench/collect.sh` detects ARMv7 with NEON and benchmarks both builds, toolchain
+defaults and `FFT_ARMV7_NEON=ON`, in one run. The build column of `results.csv`
+tells them apart.
+
+**Checked, under emulation only** (QEMU as a Cortex-A8, cross-compiled with GCC 13
+for armhf):
+
+* With the toolchain defaults (`-march=armv7-a+fp`), none of v4's kernels
+  vectorize. With `-mfpu=neon` alone, GCC still refuses. With `-mfpu=neon
+  -funsafe-math-optimizations`, all four vectorize to 128-bit NEON.
+* All 758 test checks pass with `FFT_ARMV7_NEON=ON` against the distribution FFTW
+  and against an FFTW built with `--enable-neon`, and also with the option off.
+  That includes NaN, infinity and 60 decades of power through the fast log.
+* `fft_bench --info` reports the kernel flags in the build field and
+  `fftw-3.3.10-neon` vs `fftw-3.3.10`.
+
+QEMU doesn't model the A8's unpipelined FPU, so emulated timings say nothing about
+the speedup. That needs your board.
+
+Running `collect.sh` on an A8 is slow. Start with `--quick` and `--sizes` set to
+the FFT sizes your application uses, for example
+`bench/collect.sh --name a8 --quick --sizes 1024,4096`.
 
 ## Behavior changes in v2
 
@@ -225,7 +287,7 @@ threads a branch around a constant case. `FastDb` avoids that in three ways:
 * It clamps with an integer `max` on the bits.
 * `ConvertToDb` runs two passes: the log math first, then the selects.
 
-`g++ -O3 -fopt-info-vec-missed -c FftV4.cpp` should report every kernel loop as
+`g++ -O3 -fopt-info-vec-missed -c FftV4Kernels.cpp` should report every kernel loop as
 vectorized. If a loop shows "control flow in loop", one of these patterns has crept
 back in. Clang vectorizes it either way. MSVC hasn't been checked.
 
