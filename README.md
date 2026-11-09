@@ -157,12 +157,33 @@ builds, GCC 13 leaves all four kernel loops scalar even with the flags above. It
 `-O2` vectorizer uses a "very cheap" cost model that rejects them. Build
 `FftV4Kernels.cpp` with `-O3`, or add `-ftree-vectorize -fvect-cost-model=dynamic`.
 This project's CMake adds the latter to that file automatically on every
-platform, whatever the build type. In a Yocto build for a Cortex-A9, whose tune
-already supplies `-mfpu=neon -mcpu=cortex-a9`, give `FftV4Kernels.cpp`:
+platform, whatever the build type.
+
+**Watch for link-time optimization too.** With `-flto`, the kernels are inlined
+into callers built without these flags, and the loops end up scalar. Building
+`FftV4Kernels.cpp` with `-fno-lto` keeps them as separate, vectorized functions.
+Cross-compiling for the A9 with LTO, none of the four loops vectorized without it.
+On x86, an LTO build made v4 about 1.5x slower (80–83 us vs 52–53 us at N=1024);
+`-fno-lto` on that file restored full speed. CMake adds `-fno-lto` to the file
+automatically, and it does nothing in builds without LTO.
+
+In a Yocto build for a Cortex-A9, whose tune already supplies `-mfpu=neon
+-mcpu=cortex-a9`, give `FftV4Kernels.cpp`:
 
 ```
--funsafe-math-optimizations -ftree-vectorize -fvect-cost-model=dynamic
+-funsafe-math-optimizations -ftree-vectorize -fvect-cost-model=dynamic -fno-lto
 ```
+
+In CMake, in the same directory as the target that compiles the file (or with
+`TARGET_DIRECTORY <target>`, CMake 3.18+):
+
+```cmake
+set_source_files_properties(FftV4Kernels.cpp PROPERTIES COMPILE_OPTIONS
+    "-funsafe-math-optimizations;-ftree-vectorize;-fvect-cost-model=dynamic;-fno-lto")
+```
+
+To confirm the loops vectorize in your build, add `-fopt-info-vec-optimized` to
+that file once: it should report four `loop vectorized using 16 byte vectors`.
 
 This was checked with the board's exact Yocto flags (`-mfpu=neon -mfloat-abi=hard
 -mcpu=cortex-a9 -fstack-protector-strong -O2 -D_FORTIFY_SOURCE=2`). Without the
@@ -274,6 +295,30 @@ wisdom:
   ```
   objdump -d libfftw3f.so.3 | grep -c 'mrc.*15, 0, .*cr9, cr13, {0}'   # 0 = no counter
   ```
+
+* **With the Yocto build flags at -O2, the result is the same.** A third run used
+  the board's Yocto flags for everything (`-mfpu=neon -mfloat-abi=hard
+  -mcpu=cortex-a9 -fstack-protector-strong -D_FORTIFY_SOURCE=2 -DNDEBUG -O2`),
+  plus the kernel flags above. It is the `machine` = `a9-yocto-O2` rows in
+  `bench/results.csv`:
+
+  | | N=1024 | N=4096 |
+  |---|---|---|
+  | v1 | 4355 us | 20983 us |
+  | v4, kernels without unsafe math | 3899 us | 19484 us |
+  | v4, NEON kernels | **3222 us** | **16908 us** |
+  | v4 NEON kernels in the `-O3` runs | 3233 / 3237 us | 17053 / 17430 us |
+  | NEON kernels vs v1, this run | 1.35x | 1.24x |
+
+  * **`-O2` costs nothing with the kernel flags.** The recommended setup came
+    within 3% of the `-O3` runs.
+  * **Unsafe math on the kernels is what vectorizes them.** With `-mfpu=neon` on
+    everything, the kernels stay scalar without unsafe math, and v4 is only
+    1.08–1.12x faster than v1.
+  * **`-mcpu=cortex-a9` for the whole build made no measurable difference.** v1
+    took 4355 us vs 4249–4265 us at N=1024 in the earlier runs.
+  * **Measure was again slower** (1.32x and 1.51x the time). The plan check again
+    found bad measurements in all 8 cases.
 
 ## Behavior changes in v2
 
