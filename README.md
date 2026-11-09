@@ -207,6 +207,39 @@ There are also lower-level functions: `FftwWisdom::Load`, `Save`, `Import`,
 readers never see a partial file. Every function holds `CFftwPlanLock`, so they are
 safe to call while other threads create FFT objects.
 
+### Always-fast construction: `PlanEffort::WisdomOrEstimate`
+
+`CFftV4` has a fourth planning mode that never measures. If loaded wisdom has a
+measured (Measure or Patient) plan for this size and direction, it uses that plan.
+Otherwise it falls back to an Estimate plan. Either way the constructor takes well
+under a millisecond.
+
+```cpp
+CFftwWisdomFile wisdom(cacheDir + "/fftwf.wisdom");   // or FftwWisdom::Load(path)
+CFftV4 fft(4096, 0.5f, false, CFftV4::PlanEffort::WisdomOrEstimate);
+if (!fft.PlannedFromWisdom())
+{
+    log("no FFTW wisdom for N=4096; run fft_wisdom to speed this up");
+}
+```
+
+Use it when a stall at startup is unacceptable, such as a UI or a real-time chain,
+and wisdom is generated separately with `tools/fft_wisdom`. Use `Measure` instead
+when it's fine for the first run to pay the measurement cost and fill in the file.
+
+`PlannedFromWisdom()` is true only when measured wisdom covered the plan.
+Estimate-level wisdom entries don't count, and `Estimate` mode always reports
+false. It also works with `Measure` and `Patient`: there it tells you whether the
+constructor measured or was served from wisdom. `fft_wisdom` uses it to flag sizes
+the file already covers.
+
+From the benchmark (`v4-wisdom` rows in `bench/results.csv`):
+
+| | constructor | per call |
+|---|---|---|
+| No wisdom file | same as `v4` (Estimate): 0.05–1.5 ms | same as `v4` |
+| With wisdom | same as `v4-measure`: 0.03–1.5 ms | same as `v4-measure` (FFTW builds the identical plan) |
+
 ### What to know about wisdom
 
 * **Per machine and per FFTW version.** Keep the file in a per-machine location,
@@ -251,5 +284,3 @@ cold rows. Compare absolute times across rows instead.
 * The FFT is now 70–80% of the time and runs with measured plans, so the remaining
   levers are application-level: less overlap, fewer segments, or a smaller FFT where
   resolution allows.
-* An option to plan with `FFTW_WISDOM_ONLY` and fall back to Estimate would let an
-  application guarantee a fast constructor even with no wisdom file.

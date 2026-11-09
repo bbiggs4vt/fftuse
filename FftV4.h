@@ -27,11 +27,17 @@ public:
 	/// How hard FFTW should work to find a fast plan. Estimate builds the plan
 	/// instantly. Measure/Patient make the constructor much slower but can make
 	/// Compute() faster. Worth it when one instance is reused many times.
+	///
+	/// WisdomOrEstimate never measures: it uses a measured (Measure or Patient)
+	/// plan from loaded FFTW wisdom if there is one, and otherwise falls back to
+	/// Estimate. The constructor is always fast. Load wisdom first (see
+	/// FftwWisdom.h), and check PlannedFromWisdom() to find sizes missing from it.
 	enum class PlanEffort
 	{
 		Estimate,
 		Measure,
-		Patient
+		Patient,
+		WisdomOrEstimate
 	};
 
 	/// Output value used for bins whose power is zero (or not a number), in dB.
@@ -66,6 +72,12 @@ public:
 	/// Minimum input length accepted by Compute()
 	uint32_t GetMinInputLength() const { return mFftSize; }
 
+	/// True if the plan came from measured (Measure or Patient) wisdom without
+	/// measuring. Always false for Estimate. For Measure and Patient, it says whether
+	/// the constructor was fast because wisdom covered this size. For
+	/// WisdomOrEstimate, false means it fell back to an Estimate plan.
+	bool PlannedFromWisdom() const { return mPlannedFromWisdom; }
+
 	/// Value written for empty bins (applied after shiftInDb)
 	void SetFloorDb(float floorDb) { mFloorDb = floorDb; }
 	float GetFloorDb() const { return mFloorDb; }
@@ -98,6 +110,7 @@ private:
 	uint32_t mFftSize; //!< FFT size (power of 2)
 	uint32_t mStride; //!< Stride between segments, always >= 1
 	bool mApplyWindow; //!< false in reverse mode (window is all ones)
+	bool mPlannedFromWisdom; //!< see PlannedFromWisdom()
 	float mFloorDb; //!< output value for empty bins
 	std::complex<float>* mFftIn; //!< FFTW input buffer (destroyed by each transform)
 	std::complex<float>* mFftOut; //!< FFTW output buffer

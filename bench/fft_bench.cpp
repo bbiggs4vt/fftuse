@@ -94,6 +94,9 @@ std::vector<Impl> Implementations()
 		{ "v4-measure", [](uint32_t n, float ov) {
 			 return std::unique_ptr<IRunner>(new Runner<CFftV4>(n, ov, false, CFftV4::PlanEffort::Measure));
 		 } },
+		{ "v4-wisdom", [](uint32_t n, float ov) {
+			 return std::unique_ptr<IRunner>(new Runner<CFftV4>(n, ov, false, CFftV4::PlanEffort::WisdomOrEstimate));
+		 } },
 	};
 }
 

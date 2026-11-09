@@ -581,6 +581,103 @@ void TestWisdom()
 	std::remove(junk.c_str());
 	FftwWisdom::Forget();
 }
+void TestWisdomOrEstimate()
+{
+	std::printf("WisdomOrEstimate planning\n");
+	using E = CFftV4::PlanEffort;
+	const uint32_t N = 2048;
+	auto in = Noise(N * 5, 21);
+	CFftV2 reference(N, 0.5f);
+	std::vector<float> expected;
+	reference.Compute(in, expected);
+
+	auto ctorMs = [](uint32_t n, E effort, bool reverse, bool* fromWisdom) {
+		const auto start = std::chrono::steady_clock::now();
+		CFftV4 f(n, 0.5f, reverse, effort);
+		*fromWisdom = f.PlannedFromWisdom();
+		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+	};
+
+	// No wisdom: falls back to Estimate, quickly, with correct output
+	FftwWisdom::Forget();
+	{
+		bool fromWisdom = true;
+		const double ms = ctorMs(N, E::WisdomOrEstimate, false, &fromWisdom);
+		CHECK(!fromWisdom, "no wisdom loaded");
+		CHECK(ms < 20.0, "fallback constructor took %.2f ms", ms);
+		CFftV4 f(N, 0.5f, false, E::WisdomOrEstimate);
+		std::vector<float> out;
+		f.Compute(in, out);
+		CHECK(MaxDiff(out, expected) < 1e-3f, "fallback output diff %g", MaxDiff(out, expected));
+	}
+
+	// Estimate-level wisdom (recorded by the fallback above) doesn't count
+	{
+		CFftV4 f(N, 0.5f, false, E::WisdomOrEstimate);
+		CHECK(!f.PlannedFromWisdom(), "estimate wisdom must not count");
+		CFftV4 e(N, 0.5f);
+		CHECK(!e.PlannedFromWisdom(), "Estimate never reports wisdom");
+	}
+
+	// A Measure construction measures (not from wisdom) and records wisdom...
+	{
+		CFftV4 m(N, 0.5f, false, E::Measure);
+		CHECK(!m.PlannedFromWisdom(), "first Measure plan had to measure");
+	}
+	// ...which later constructions use without measuring
+	{
+		bool fromWisdom = false;
+		const double ms = ctorMs(N, E::WisdomOrEstimate, false, &fromWisdom);
+		CHECK(fromWisdom, "measured wisdom should be used");
+		CHECK(ms < 20.0, "wisdom constructor took %.2f ms", ms);
+		CFftV4 m(N, 0.5f, false, E::Measure);
+		CHECK(m.PlannedFromWisdom(), "Measure reports it came from wisdom");
+		CFftV4 f(N, 0.5f, false, E::WisdomOrEstimate);
+		std::vector<float> out;
+		f.Compute(in, out);
+		CHECK(MaxDiff(out, expected) < 1e-3f, "wisdom output diff %g", MaxDiff(out, expected));
+		CFftV4 e(N, 0.5f);
+		CHECK(!e.PlannedFromWisdom(), "Estimate never reports wisdom");
+	}
+
+	// Wisdom is per shape: the reverse direction and other sizes aren't covered
+	{
+		CFftV4 r(N, 0.5f, true, E::WisdomOrEstimate);
+		CHECK(!r.PlannedFromWisdom(), "reverse not in wisdom");
+		CFftV4 other(N * 2, 0.5f, false, E::WisdomOrEstimate);
+		CHECK(!other.PlannedFromWisdom(), "other size not in wisdom");
+	}
+
+	// Patient wisdom also counts
+	FftwWisdom::Forget();
+	{
+		CFftV4 p(128, 0.5f, false, E::Patient);
+		CHECK(!p.PlannedFromWisdom(), "first Patient plan had to measure");
+		CFftV4 f(128, 0.5f, false, E::WisdomOrEstimate);
+		CHECK(f.PlannedFromWisdom(), "patient wisdom should count");
+	}
+
+	// The full flow: wisdom saved to a file, then loaded in a fresh state
+	const std::string path = "fft_tests_woe_" +
+		std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".wisdom";
+	{
+		CFftV4 m(512, 0.5f, false, E::Measure);
+	}
+	CHECK(FftwWisdom::Save(path), "save");
+	FftwWisdom::Forget();
+	{
+		CFftV4 before(512, 0.5f, false, E::WisdomOrEstimate);
+		CHECK(!before.PlannedFromWisdom(), "forgotten");
+	}
+	FftwWisdom::Forget();
+	CHECK(FftwWisdom::Load(path), "load");
+	{
+		CFftV4 after(512, 0.5f, false, E::WisdomOrEstimate);
+		CHECK(after.PlannedFromWisdom(), "loaded from file");
+	}
+	std::remove(path.c_str());
+	FftwWisdom::Forget();
+}
 } // namespace
 
 int main()
@@ -595,6 +692,7 @@ int main()
 	TestV3();
 	TestV4();
 	TestWisdom();
+	TestWisdomOrEstimate();
 	std::printf("\n%d/%d checks passed\n", gChecks - gFailures, gChecks);
 	return gFailures == 0 ? 0 : 1;
 }

@@ -49,10 +49,21 @@ void Usage()
 }
 
 template <typename T>
-double PlanMs(uint32_t size, bool reverse, typename T::PlanEffort effort)
+double PlanMs(uint32_t size, bool reverse, typename T::PlanEffort effort, const char** note)
 {
 	const auto start = std::chrono::steady_clock::now();
 	T fft(size, 0.5f, reverse, effort);
+	*note = "";
+	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+// v4 can tell whether wisdom already covered the plan
+template <>
+double PlanMs<CFftV4>(uint32_t size, bool reverse, CFftV4::PlanEffort effort, const char** note)
+{
+	const auto start = std::chrono::steady_clock::now();
+	CFftV4 fft(size, 0.5f, reverse, effort);
+	*note = fft.PlannedFromWisdom() ? "  (already in wisdom)" : "";
 	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 } // namespace
@@ -100,19 +111,20 @@ int main(int argc, char** argv)
 				for (const std::string& cls : classes)
 				{
 					double ms;
+					const char* note = "";
 					if (cls == "v2")
-						ms = PlanMs<CFftV2>(size, dir == 1, patient ? CFftV2::PlanEffort::Patient : CFftV2::PlanEffort::Measure);
+						ms = PlanMs<CFftV2>(size, dir == 1, patient ? CFftV2::PlanEffort::Patient : CFftV2::PlanEffort::Measure, &note);
 					else if (cls == "v3")
-						ms = PlanMs<CFftV3>(size, dir == 1, patient ? CFftV3::PlanEffort::Patient : CFftV3::PlanEffort::Measure);
+						ms = PlanMs<CFftV3>(size, dir == 1, patient ? CFftV3::PlanEffort::Patient : CFftV3::PlanEffort::Measure, &note);
 					else if (cls == "v4")
-						ms = PlanMs<CFftV4>(size, dir == 1, patient ? CFftV4::PlanEffort::Patient : CFftV4::PlanEffort::Measure);
+						ms = PlanMs<CFftV4>(size, dir == 1, patient ? CFftV4::PlanEffort::Patient : CFftV4::PlanEffort::Measure, &note);
 					else
 					{
 						std::printf("unknown class %s\n", cls.c_str());
 						return 2;
 					}
-					std::printf("  %-3s N=%-8u %-8s %-7s %9.1f ms\n", cls.c_str(), size, dir ? "reverse" : "forward",
-						effort.c_str(), ms);
+					std::printf("  %-3s N=%-8u %-8s %-7s %9.1f ms%s\n", cls.c_str(), size, dir ? "reverse" : "forward",
+						effort.c_str(), ms, note);
 				}
 			}
 		}

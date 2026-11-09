@@ -38,6 +38,7 @@ unsigned PlanFlags(CFftV4::PlanEffort effort)
 	{
 	case CFftV4::PlanEffort::Measure: return FFTW_MEASURE;
 	case CFftV4::PlanEffort::Patient: return FFTW_PATIENT;
+	case CFftV4::PlanEffort::WisdomOrEstimate: // handled in the constructor
 	case CFftV4::PlanEffort::Estimate:
 	default: return FFTW_ESTIMATE;
 	}
@@ -147,6 +148,7 @@ CFftV4::CFftV4(uint32_t fftSize, float overlap, bool reverse, PlanEffort effort)
 	mFftSize(0),
 	mStride(0),
 	mApplyWindow(!reverse),
+	mPlannedFromWisdom(false),
 	mFloorDb(kDefaultFloorDb),
 	mFftIn(nullptr),
 	mFftOut(nullptr),
@@ -183,11 +185,27 @@ CFftV4::CFftV4(uint32_t fftSize, float overlap, bool reverse, PlanEffort effort)
 	}
 	// DESTROY_INPUT: the input buffer is rewritten for every segment anyway, and it
 	// lets FFTW use faster out-of-place algorithms
-	mFftwPlan = fftwf_plan_dft_1d(static_cast<int>(mFftSize),
-		reinterpret_cast<fftwf_complex*>(mFftIn),
-		reinterpret_cast<fftwf_complex*>(mFftOut),
-		reverse ? FFTW_BACKWARD : FFTW_FORWARD,
-		PlanFlags(effort) | FFTW_DESTROY_INPUT);
+	auto plan = [&](unsigned flags) {
+		return fftwf_plan_dft_1d(static_cast<int>(mFftSize),
+			reinterpret_cast<fftwf_complex*>(mFftIn),
+			reinterpret_cast<fftwf_complex*>(mFftOut),
+			reverse ? FFTW_BACKWARD : FFTW_FORWARD,
+			flags | FFTW_DESTROY_INPUT);
+	};
+
+	// Probe for measured wisdom. MEASURE | WISDOM_ONLY returns null unless wisdom
+	// recorded at Measure or Patient rigor covers this plan, and it never measures.
+	// Estimate-level wisdom entries don't count.
+	if (effort != PlanEffort::Estimate)
+	{
+		const unsigned probe = (effort == PlanEffort::Patient) ? FFTW_PATIENT : FFTW_MEASURE;
+		mFftwPlan = plan(probe | FFTW_WISDOM_ONLY);
+		mPlannedFromWisdom = (mFftwPlan != nullptr);
+	}
+	if (mFftwPlan == nullptr)
+	{
+		mFftwPlan = plan(PlanFlags(effort));
+	}
 	if (mFftwPlan == nullptr)
 	{
 		// The destructor won't run for a throwing constructor
