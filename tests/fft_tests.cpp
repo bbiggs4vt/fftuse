@@ -6,6 +6,10 @@
 #include "FftV2.h"
 #include "FftV3.h"
 #include "FftV4.h"
+#include "FftwWisdom.h"
+
+#include <chrono>
+#include <fstream>
 
 #include <cfloat>
 #include <cstdio>
@@ -465,6 +469,118 @@ void TestV4()
 		CHECK(peak == 512 + 100 && std::fabs(out[peak]) < 0.01f, "peak %ld at %g dB", static_cast<long>(peak), out[peak]);
 	}
 }
+bool FileExists(const std::string& path)
+{
+	std::ifstream f(path);
+	return f.good();
+}
+
+/// Whether FFTW can build v4's forward plan for N from wisdom alone
+bool V4PlanInWisdom(uint32_t N)
+{
+	dsp::utility::CFftwPlanLock lock;
+	fftwf_complex* in = fftwf_alloc_complex(N);
+	fftwf_complex* out = fftwf_alloc_complex(N);
+	fftwf_plan p = fftwf_plan_dft_1d(static_cast<int>(N), in, out, FFTW_FORWARD,
+		FFTW_MEASURE | FFTW_DESTROY_INPUT | FFTW_WISDOM_ONLY);
+	const bool ok = p != nullptr;
+	if (p)
+	{
+		fftwf_destroy_plan(p);
+	}
+	fftwf_free(in);
+	fftwf_free(out);
+	return ok;
+}
+
+double MeasureCtorMs(uint32_t N)
+{
+	const auto start = std::chrono::steady_clock::now();
+	CFftV4 f(N, 0.5f, false, CFftV4::PlanEffort::Measure);
+	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+void TestWisdom()
+{
+	std::printf("wisdom\n");
+	const std::string base = "fft_tests_wisdom_" +
+		std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+	const std::string path = base + ".wisdom";
+	const std::string junk = base + ".junk";
+
+	CHECK(!FftwWisdom::Load(path), "missing file must fail");
+	{
+		std::ofstream(junk) << "not wisdom";
+	}
+	CHECK(!FftwWisdom::Load(junk), "garbage file must fail");
+	CHECK(!FftwWisdom::Import("garbage"), "garbage text must fail");
+	CHECK(!FftwWisdom::Save("no_such_dir_xyz/sub/fftwf.wisdom"), "unwritable path must fail");
+
+	// Gather, save, forget, reload
+	FftwWisdom::Forget();
+	CHECK(!V4PlanInWisdom(512), "no wisdom after Forget");
+	const double coldMs = MeasureCtorMs(512);
+	CHECK(V4PlanInWisdom(512), "Measure construction should record wisdom");
+	CHECK(FftwWisdom::Save(path), "save");
+	CHECK(FileExists(path), "file written");
+	FftwWisdom::Forget();
+	CHECK(!V4PlanInWisdom(512), "forgotten");
+	CHECK(FftwWisdom::Load(path), "load");
+	CHECK(V4PlanInWisdom(512), "plan available from loaded wisdom");
+	const double warmMs = MeasureCtorMs(512);
+	CHECK(warmMs < coldMs / 4.0 || warmMs < 1.0, "warm %.2f ms should be far below cold %.2f ms", warmMs, coldMs);
+
+	// String round trip
+	const std::string text = FftwWisdom::Export();
+	CHECK(!text.empty(), "export");
+	FftwWisdom::Forget();
+	CHECK(FftwWisdom::Import(text) && V4PlanInWisdom(512), "import round trip");
+
+	// Results with wisdom match results from a cold Estimate plan
+	{
+		auto in = Noise(512 * 5, 3);
+		CFftV4 warm(512, 0.5f, false, CFftV4::PlanEffort::Measure);
+		FftwWisdom::Forget();
+		CFftV4 cold(512, 0.5f);
+		std::vector<float> a, b;
+		warm.Compute(in, a);
+		cold.Compute(in, b);
+		CHECK(MaxDiff(a, b) < 1e-3f, "diff %g dB", MaxDiff(a, b));
+	}
+
+	// CFftwWisdomFile: saves only when wisdom changed
+	std::remove(path.c_str());
+	FftwWisdom::Forget();
+	{
+		CFftwWisdomFile scope(path);
+		CHECK(!scope.Loaded(), "nothing to load yet");
+		CHECK(scope.SaveIfChanged() && !FileExists(path), "no new wisdom, so no file");
+		// FFTW records Estimate plans too, but they can't stand in for Measure ones
+		CFftV4 estimateOnly(1024, 0.5f);
+	}
+	FftwWisdom::Forget();
+	if (FileExists(path))
+	{
+		CHECK(FftwWisdom::Load(path), "estimate wisdom loads");
+	}
+	CHECK(!V4PlanInWisdom(1024), "estimate wisdom must not satisfy a Measure plan");
+	{
+		CFftwWisdomFile scope(path);
+		CFftV4 measured(1024, 0.5f, false, CFftV4::PlanEffort::Measure);
+	}
+	CHECK(FileExists(path), "new wisdom saved on destruction");
+	FftwWisdom::Forget();
+	{
+		CFftwWisdomFile scope(path);
+		CHECK(scope.Loaded(), "loads the saved file");
+		CHECK(V4PlanInWisdom(1024), "and its plans");
+		CHECK(scope.SaveIfChanged(), "nothing changed is success");
+	}
+
+	std::remove(path.c_str());
+	std::remove(junk.c_str());
+	FftwWisdom::Forget();
+}
 } // namespace
 
 int main()
@@ -478,6 +594,7 @@ int main()
 	TestRepeatedCallsIndependent();
 	TestV3();
 	TestV4();
+	TestWisdom();
 	std::printf("\n%d/%d checks passed\n", gChecks - gFailures, gChecks);
 	return gFailures == 0 ? 0 : 1;
 }

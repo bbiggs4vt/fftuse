@@ -6,6 +6,8 @@
 | `FftV2.h` / `FftV2.cpp` | `CFftV2` | Bug fixes and the first speedups |
 | `FftV3.h` / `FftV3.cpp` | `CFftV3` | Experiment: batched segments with `fftwf_plan_many_dft`. Not faster; kept for the record |
 | `FftV4.h` / `FftV4.cpp` | `CFftV4` | Fastest: out-of-place FFT and vectorized dB conversion. Use this one |
+| `FftwWisdom.h` / `FftwWisdom.cpp` | `FftwWisdom::*`, `CFftwWisdomFile` | Save and load FFTW wisdom so measured plans are instant (works with v2–v4) |
+| `tools/fft_wisdom.cpp` | | Command-line tool that generates a wisdom file |
 
 All four build side by side so they can be tested and benchmarked against each
 other. v2, v3 and v4 share the same interface and behavior.
@@ -21,6 +23,7 @@ cmake --build build -j
 ./build/fft_tests       # correctness, including v2 == v1 on valid inputs
 ./build/v1_bug_repro    # runs each reported bug against v1 and v2 (ASan/UBSan, Linux/macOS)
 ./build/fft_bench       # performance
+./build/fft_wisdom -o fftwf.wisdom   # generate FFTW wisdom for this machine
 ```
 
 `compat/` has stand-ins for `stdafx.h` and `dsp::utility::CFftwPlanLock`, a mutex
@@ -164,10 +167,89 @@ threads a branch around a constant case. `FastDb` avoids that in three ways:
 vectorized. If a loop shows "control flow in loop", one of these patterns has crept
 back in. Clang vectorizes it either way. MSVC hasn't been checked.
 
+## FFTW wisdom
+
+Wisdom is FFTW's record of which algorithms ran fastest on this machine. With it
+loaded, `PlanEffort::Measure` costs nothing at construction time.
+
+### Using it
+
+Load the wisdom once at startup, before creating any FFT objects:
+
+```cpp
+#include "FftwWisdom.h"
+
+int main()
+{
+    // Loads the file if it exists. On destruction, saves it again if new plans were measured.
+    CFftwWisdomFile wisdom(cacheDir + "/fftwf.wisdom");
+
+    CFftV4 fft(4096, 0.5f, false, CFftV4::PlanEffort::Measure);   // instant once the file has this size
+    ...
+}
+```
+
+* **First run:** Measure plans pay their measurement cost, and the file is written
+  at exit.
+* **Later runs:** the file loads and Measure plans are built instantly.
+
+You can also generate the file ahead of time, for example at install, so no run is
+slow:
+
+```
+./build/fft_wisdom -o fftwf.wisdom --sizes 1024,4096,16384 --class v4
+./build/fft_wisdom -o fftwf.wisdom --sizes 32768            # extends the same file
+./build/fft_wisdom -o fftwf.wisdom --effort patient --reverse
+```
+
+There are also lower-level functions: `FftwWisdom::Load`, `Save`, `Import`,
+`Export` and `Forget`. `Save` writes a temporary file and renames it into place, so
+readers never see a partial file. Every function holds `CFftwPlanLock`, so they are
+safe to call while other threads create FFT objects.
+
+### What to know about wisdom
+
+* **Per machine and per FFTW version.** Keep the file in a per-machine location,
+  such as a user cache directory, not in source control. FFTW rejects wisdom from
+  another version (`Load` returns false). It accepts wisdom from another CPU, but
+  the plans won't be tuned for this one.
+* **Per plan shape.** Wisdom depends on size, direction, in-place vs out-of-place,
+  and flags. v2/v3 (in-place) and v4 (out-of-place) need their own entries, so
+  generate with `--class` set to the class the application uses. FFTW does share
+  sub-transforms between the two, which is why some v4 sizes planned instantly
+  right after v2 in the generator output.
+* **Estimate gets the benefit too.** An object built with `PlanEffort::Estimate`
+  uses Measure wisdom if it is loaded, so it gets the measured plan with no risk of
+  a slow constructor. In the benchmark below, v4 and v4-measure run at the same
+  speed once wisdom is loaded.
+* **Patient needs Patient wisdom.** Measure wisdom doesn't satisfy a Patient plan.
+* **Estimate entries are harmless.** FFTW also records Estimate plans as wisdom, so
+  the file can be rewritten after a run with only Estimate plans. Those entries
+  never stand in for a Measure plan.
+
+### Results
+
+`./build/fft_bench --wisdom fftwf.wisdom` loads the file before each construction.
+Those rows are tagged `[wisdom]` in `bench/results.csv`. Compared with the cold
+runs:
+
+| N | v4-measure constructor, cold | with wisdom | v4 (Estimate) per call, cold | with wisdom |
+|---|---|---|---|---|
+| 256 | 40 ms | 0.03 ms | 10.4 us | 10.3 us |
+| 1024 | 75 ms | 0.07 ms | 52 us | 45 us |
+| 4096 | 122 ms | 0.11 ms | 258 us | 214 us |
+| 16384 | 260 ms | 0.7 ms | 1940 us | 1400 us |
+| 65536 | 877 ms | 1.4 ms | 8290 us | 6810 us |
+
+With wisdom, the time left in the constructor is mostly computing the window, not
+planning. Wisdom also speeds up v1, which uses in-place Estimate plans and picks up
+v2's wisdom. That makes the speedup-vs-v1 column in `[wisdom]` rows lower than in
+cold rows. Compare absolute times across rows instead.
+
 ### Next ideas
 
-* Save FFTW wisdom to a file (`fftwf_export_wisdom_to_filename`), so the Measure
-  constructor cost is paid once per machine, not once per process. Measure gives v4
-  another 1.05–1.5x.
-* The FFT is now 70–80% of the time. Beyond Measure planning, the remaining lever is
-  doing fewer transforms, for example less overlap if the application allows it.
+* The FFT is now 70–80% of the time and runs with measured plans, so the remaining
+  levers are application-level: less overlap, fewer segments, or a smaller FFT where
+  resolution allows.
+* An option to plan with `FFTW_WISDOM_ONLY` and fall back to Estimate would let an
+  application guarantee a fast constructor even with no wisdom file.

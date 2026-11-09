@@ -11,6 +11,8 @@
 //   ./fft_bench --sizes 1024,8192 --segments 64 --overlap 0.75 --min-time 200
 //   ./fft_bench --only v2,v4             # just these (v1 always runs as the baseline)
 //   ./fft_bench --only "v4*"             # v4 and v4-measure
+//   ./fft_bench --wisdom fftwf.wisdom    # construct with this wisdom loaded (warm start);
+//                                        # make it with tools/fft_wisdom
 //
 // To add a new version (e.g. CFftV3), include its header and add a line to
 // Implementations() below.
@@ -20,6 +22,7 @@
 #include "FftV2.h"
 #include "FftV3.h"
 #include "FftV4.h"
+#include "FftwWisdom.h"
 
 #include <algorithm>
 #include <chrono>
@@ -105,6 +108,7 @@ struct Options
 	std::string csvPath;
 	std::string label;
 	std::string only;
+	std::string wisdomPath; // empty: every construction is cold
 };
 
 struct Result
@@ -138,9 +142,11 @@ Result Measure(const Impl& impl, const Options& opt, uint32_t requestedSize, uin
 
 	// Drop plans FFTW remembers from earlier constructions so every constructor
 	// time is a cold one (otherwise Measure/Patient look free after the first).
+	// With --wisdom, start from that file instead: the warm-start case.
+	FftwWisdom::Forget();
+	if (!opt.wisdomPath.empty())
 	{
-		dsp::utility::CFftwPlanLock lock;
-		fftwf_forget_wisdom();
+		FftwWisdom::Load(opt.wisdomPath);
 	}
 	const auto t0 = Clock::now();
 	std::unique_ptr<IRunner> fft = impl.make(requestedSize, opt.overlap);
@@ -229,7 +235,7 @@ void Usage()
 	std::printf(
 		"usage: fft_bench [--quick] [--sizes a,b,c] [--bins-div a,b] [--segments K]\n"
 		"                 [--overlap f] [--min-time ms] [--samples n] [--only a,b,prefix*]\n"
-		"                 [--csv path] [--label text]\n");
+		"                 [--csv path] [--label text] [--wisdom file]\n");
 }
 
 bool ParseArgs(int argc, char** argv, Options& opt)
@@ -261,6 +267,7 @@ bool ParseArgs(int argc, char** argv, Options& opt)
 		else if (a == "--only") opt.only = next();
 		else if (a == "--csv") opt.csvPath = next();
 		else if (a == "--label") opt.label = next();
+		else if (a == "--wisdom") opt.wisdomPath = next();
 		else
 		{
 			Usage();
@@ -277,6 +284,18 @@ int main(int argc, char** argv)
 	if (!ParseArgs(argc, argv, opt))
 	{
 		return 2;
+	}
+
+	if (!opt.wisdomPath.empty() && !FftwWisdom::Load(opt.wisdomPath))
+	{
+		std::printf("can't load wisdom from %s\n", opt.wisdomPath.c_str());
+		return 2;
+	}
+
+	// Keep warm-start rows distinguishable in the CSV history
+	if (!opt.wisdomPath.empty())
+	{
+		opt.label += opt.label.empty() ? "[wisdom]" : " [wisdom]";
 	}
 
 	std::vector<Impl> impls = Implementations();
@@ -304,8 +323,9 @@ int main(int argc, char** argv)
 	const std::time_t now = std::time(nullptr);
 	std::strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S", std::localtime(&now));
 
-	std::printf("segments/call=%u overlap=%.2f min-time=%.0fms samples=%d%s%s\n\n", opt.segments, opt.overlap,
-		opt.minTimeMs, opt.samples, opt.label.empty() ? "" : " label=", opt.label.c_str());
+	std::printf("segments/call=%u overlap=%.2f min-time=%.0fms samples=%d wisdom=%s%s%s\n\n", opt.segments, opt.overlap,
+		opt.minTimeMs, opt.samples, opt.wisdomPath.empty() ? "none (cold)" : opt.wisdomPath.c_str(),
+		opt.label.empty() ? "" : " label=", opt.label.c_str());
 	std::printf("%-12s %7s %7s %10s %12s %12s %10s %9s %10s\n", "impl", "N", "bins", "ctor ms", "us/call",
 		"ns/segment", "Msamp/s", "speedup", "max dB diff");
 	std::printf("%s\n", std::string(98, '-').c_str());
