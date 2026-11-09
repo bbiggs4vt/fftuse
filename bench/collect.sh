@@ -123,7 +123,15 @@ done
 FIRST="$BUILD-${VARIANTS[0]}"
 "$FIRST/fft_bench" --info --machine "$NAME" | tee "$OUT/machine.txt"
 if [ -x "$FIRST/v1_bug_repro" ]; then
-	"$FIRST/v1_bug_repro" > "$OUT/v1_bug_repro.log" 2>&1 || true
+	# Informational: runs the original class's bugs in child processes. Each scenario
+	# has its own time limit; `timeout` is a backstop for the whole step.
+	log "v1 bug repro (informational, up to a few minutes)"
+	REPRO=("$FIRST/v1_bug_repro")
+	if command -v timeout >/dev/null; then
+		REPRO=(timeout 600 "${REPRO[@]}")
+	fi
+	"${REPRO[@]}" > "$OUT/v1_bug_repro.log" 2>&1 || echo "(repro ended early; see v1_bug_repro.log)"
+	cat "$OUT/v1_bug_repro.log"
 fi
 
 # Pin to one CPU so the scheduler doesn't move the benchmark between cores. On

@@ -3,19 +3,32 @@
 // or sanitizer abort is contained. Build with ASan/UBSan (the CMake target
 // v1_bug_repro does) to catch out-of-bounds accesses that don't segfault.
 //
-// Linux/macOS only (uses fork).
+// Linux/macOS only (uses fork). Each scenario gets FFT_REPRO_TIMEOUT seconds
+// (default 30) before it is killed and reported as a hang. Some v1 bugs hang
+// instead of crashing: on ARM, overlap = 1 makes the segment count +inf, which
+// converts to 4294967295 there (it converts to 0 on x86).
 
 #include "stdafx.h"
 #include "Fft.h"
 #include "FftV2.h"
 
 #include <cfloat>
+#include <csignal>
+#include <cstdlib>
 #include <cstdio>
 #include <functional>
 #include <stdexcept>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
+
+// Leak checking adds nothing here (scenarios exit straight after the bug) and
+// LeakSanitizer can fail at exit under emulators or debuggers, so turn it off.
+// Read by AddressSanitizer at startup; harmless without it.
+extern "C" const char* __asan_default_options()
+{
+	return "detect_leaks=0";
+}
 
 namespace
 {
@@ -25,14 +38,25 @@ const int kBadOutput = 10;  // ran, output was garbage
 const int kThrew = 11;      // threw a std::exception (the v2 behavior we want)
 const int kNoCopy = 12;     // type isn't copyable, so the scenario can't be written
 
+unsigned TimeoutSeconds()
+{
+	const char* env = std::getenv("FFT_REPRO_TIMEOUT");
+	const long v = env ? std::strtol(env, nullptr, 10) : 0;
+	return v > 0 ? static_cast<unsigned>(v) : 30u;
+}
+
 std::string RunIsolated(const std::function<int()>& body)
 {
 	std::fflush(stdout);
+	const unsigned timeout = TimeoutSeconds();
 	pid_t pid = fork();
 	if (pid == 0)
 	{
 		// Silence sanitizer reports in the child; the parent reports the outcome
 		if (!freopen("/dev/null", "w", stderr)) {}
+		// SIGALRM's default action ends the child if the scenario hangs
+		std::signal(SIGALRM, SIG_DFL);
+		alarm(timeout);
 		int rc;
 		try
 		{
@@ -48,6 +72,10 @@ std::string RunIsolated(const std::function<int()>& body)
 	waitpid(pid, &status, 0);
 	if (WIFSIGNALED(status))
 	{
+		if (WTERMSIG(status) == SIGALRM)
+		{
+			return "HANG (killed after " + std::to_string(timeout) + " s)";
+		}
 		return "CRASH (signal " + std::to_string(WTERMSIG(status)) + ")";
 	}
 	switch (WEXITSTATUS(status))
@@ -194,6 +222,8 @@ int main()
 		const std::string a = RunIsolated(r.v1);
 		const std::string b = RunIsolated(r.v2);
 		std::printf("%-40s %-40s %s\n", r.name, a.c_str(), b.c_str());
+		// Show progress even when stdout is a file
+		std::fflush(stdout);
 	}
 	return 0;
 }
