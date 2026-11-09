@@ -26,14 +26,27 @@ if(UNIX AND NOT APPLE)
   list(APPEND FFT_LINK_LIBS m)
 endif()
 
-# 32-bit ARM (ARMv7: Cortex-A8/A9/...): GCC only vectorizes float loops for NEON
-# with -funsafe-math-optimizations. This applies it, plus -mfpu=neon, to CFftV4's
-# kernels only (FftV4Kernels.cpp); everything else keeps the toolchain's flags.
-# The resulting binary needs a CPU with NEON. See FftV4Kernels.h.
+# Flags for CFftV4's kernels only (FftV4Kernels.cpp); everything else keeps the
+# toolchain's flags. See FftV4Kernels.h.
+#
+# Always, where supported: -ftree-vectorize -fvect-cost-model=dynamic. GCC's -O2
+# (the default in Yocto and many distro builds) uses the "very cheap" cost model,
+# which leaves all four kernel loops scalar; -O3 or these flags vectorize them.
+#
+# FFT_ARMV7_NEON (32-bit ARM, e.g. Cortex-A8/A9): adds -mfpu=neon
+# -funsafe-math-optimizations. ARMv7 GCC only vectorizes float loops for NEON with
+# the latter. The resulting binary needs a CPU with NEON.
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-ftree-vectorize -fvect-cost-model=dynamic" FFT_HAVE_VECT_COST_MODEL)
 option(FFT_ARMV7_NEON "Build CFftV4's kernels with -mfpu=neon -funsafe-math-optimizations (32-bit ARM)" OFF)
 set(FFT_V4_KERNEL_FLAGS "")
+if(FFT_HAVE_VECT_COST_MODEL)
+  list(APPEND FFT_V4_KERNEL_FLAGS -ftree-vectorize -fvect-cost-model=dynamic)
+endif()
 if(FFT_ARMV7_NEON)
-  set(FFT_V4_KERNEL_FLAGS -mfpu=neon -funsafe-math-optimizations)
+  list(APPEND FFT_V4_KERNEL_FLAGS -mfpu=neon -funsafe-math-optimizations)
+endif()
+if(FFT_V4_KERNEL_FLAGS)
   set_source_files_properties(FftV4Kernels.cpp PROPERTIES COMPILE_OPTIONS "${FFT_V4_KERNEL_FLAGS}")
 endif()
 string(REPLACE ";" " " FFT_V4_KERNEL_FLAGS_TEXT "${FFT_V4_KERNEL_FLAGS}")

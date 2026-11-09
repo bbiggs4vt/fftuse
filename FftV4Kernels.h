@@ -14,7 +14,15 @@
 // handling. Don't use -ffast-math here: its -ffinite-math-only lets the compiler
 // drop the NaN and infinity checks in ConvertToDb.
 //
-// On x86-64 and AArch64 the default flags already vectorize these loops.
+// Optimization level matters too. GCC's -O2 (the default in Yocto and many
+// distro builds) uses its "very cheap" vectorizer cost model, which leaves all
+// four loops scalar. Build this file with -O3, or add
+//     -ftree-vectorize -fvect-cost-model=dynamic
+// (CMake does this automatically). So a Yocto build for a Cortex-A9, whose
+// tune already supplies -mfpu=neon, needs for this file:
+//     -funsafe-math-optimizations -ftree-vectorize -fvect-cost-model=dynamic
+//
+// On x86-64 and AArch64, -O3 (or the two vectorizer flags) is all these loops need.
 //
 // Internal to CFftV4; not a public interface.
 
