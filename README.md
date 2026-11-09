@@ -24,6 +24,7 @@ cmake --build build -j
 ./build/v1_bug_repro    # runs each reported bug against v1 and v2 (ASan/UBSan, Linux/macOS)
 ./build/fft_bench       # performance
 ./build/fft_wisdom -o fftwf.wisdom   # generate FFTW wisdom for this machine
+bench/collect.sh --name <machine>   # everything above, packed into one archive to share
 ```
 
 `compat/` has stand-ins for `stdafx.h` and `dsp::utility::CFftwPlanLock`, a mutex
@@ -50,8 +51,69 @@ output. The difference column catches a speedup that changes the results.
 `--csv` appends rows, so the file keeps a history across iterations. To benchmark a
 new version, add one line to `Implementations()` in `bench/fft_bench.cpp`.
 
-`bench/results.csv` holds the first run, taken in a 4-core cloud VM, so treat the
-absolute numbers as rough.
+`bench/results.csv` holds the runs made during development, all on one 4-core x86
+cloud VM (`machine` = `cloud-vm-x86`), so treat the absolute numbers as rough.
+
+## Running the benchmarks on another machine (ARM, etc.)
+
+On the target machine, from a checkout:
+
+```
+bench/collect.sh --name <machine>           # full run, about 5–15 minutes
+bench/collect.sh --name <machine> --quick   # about 1–3 minutes
+```
+
+It produces `bench-results-<machine>-<timestamp>.tar.gz`. Send that file back. The
+script:
+
+1. Records system information: CPU and cores (`lscpu`), board model, compiler,
+   commit, governor and frequency range per core, temperatures before and after,
+   memory, and load.
+2. Builds in Release mode. Pass extra CMake options with `CMAKE_ARGS`, for example
+   `CMAKE_ARGS=-DCMAKE_PREFIX_PATH=/opt/fftw`.
+3. Runs the correctness tests (`tests.log`). They matter as much as the timings on
+   a new architecture, so the script still benchmarks when they fail, but says so.
+4. Runs the v1 bug repro if the toolchain supports sanitizers.
+5. Generates FFTW wisdom for this machine.
+6. Benchmarks every version twice, without and with the wisdom, into one
+   `results.csv`.
+
+The benchmark is pinned with `taskset` to the core with the highest maximum
+frequency, which picks a big core on big.LITTLE chips. Set `BENCH_CPU=<n>` to choose
+a different core.
+
+Every CSV row records the machine, architecture, CPU, thread count, governor,
+compiler, build flags, the SIMD the compiler targeted, and FFTW's version string
+(which lists FFTW's SIMD support, e.g. `fftw-3.3.10-neon`). CSVs from different
+machines can be concatenated, minus their header lines, and compared directly.
+`./build/fft_bench --info` prints the same details without running anything.
+
+For steadier numbers on boards that throttle:
+
+* Set the governor to `performance` while benchmarking: `sudo cpupower frequency-set -g performance`,
+  or write to `/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor`. The output
+  warns when it isn't.
+* Use a heatsink or fan. The before and after temperatures in `system.txt` show
+  whether it got hot.
+* Close other workloads.
+
+### Checked on AArch64
+
+The code was cross-compiled with GCC 13 for AArch64 and run under QEMU against
+Ubuntu's arm64 FFTW 3.3.10, which is built with NEON. Emulated timings mean nothing,
+so this checks correctness only:
+
+* All 758 test checks pass, including the fast-log and wisdom tests.
+* v4's window, accumulate and dB kernels vectorize to 128-bit NEON, the same as SSE
+  on x86.
+* `fft_bench` and `fft_wisdom` run and record `aarch64`, `neon+fma` and
+  `fftw-3.3.10-neon`.
+
+Not checked: real ARM timings, and detecting the CPU model on real ARM hardware.
+
+On **32-bit ARM (ARMv7)**, GCC doesn't auto-vectorize float loops for NEON without
+`-funsafe-math-optimizations`, because ARMv7 NEON isn't fully IEEE-compliant. The
+code still runs correctly there, but v4's kernels run scalar, so expect smaller gains.
 
 ## Behavior changes in v2
 
