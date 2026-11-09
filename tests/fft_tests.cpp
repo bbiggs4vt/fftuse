@@ -4,6 +4,7 @@
 #include "stdafx.h"
 #include "Fft.h"
 #include "FftV2.h"
+#include "FftV3.h"
 
 #include <cfloat>
 #include <cstdio>
@@ -254,6 +255,94 @@ void TestRepeatedCallsIndependent()
 	f.Compute(a, r3);
 	CHECK(r1 == r3, "same input should give bit-identical output");
 }
+void TestV3()
+{
+	std::printf("v3 validation\n");
+	CHECK(!std::is_copy_constructible<CFftV3>::value, "CFftV3 must not be copyable");
+	CHECK(Throws<std::invalid_argument>([] { CFftV3 f(0, 0.5f); }), "fftSize 0");
+	CHECK(Throws<std::invalid_argument>([] { CFftV3 f(1024, 1.0f); }), "overlap 1");
+	CHECK(Throws<std::invalid_argument>([] { CFftV3 f(1024, 0.5f, false, CFftV3::PlanEffort::Estimate, CFftV3::kMaxBatchSize + 1); }), "batch too big");
+	{
+		CFftV3 f(1024, 0.5f);
+		std::vector<float> out(1024);
+		auto in = Noise(1000, 1);
+		CHECK(Throws<std::invalid_argument>([&] { f.Compute(in.data(), 1000, out.data()); }), "short input");
+		CHECK(Throws<std::invalid_argument>([&] { f.Compute(in.data(), 1000, out.data(), 0.0f, 2000); }), "bins > N");
+		std::vector<float> v;
+		auto ok = Noise(4096, 2);
+		f.Compute(ok, v, 0.0f, 10);
+		CHECK(v.size() == 10, "got %zu", v.size());
+	}
+	// Auto batch size targets kAutoBatchBytes, at least 1
+	CHECK(CFftV3(1024, 0.5f).GetBatchSize() == 32, "got %u", CFftV3(1024, 0.5f).GetBatchSize());
+	CHECK(CFftV3(1u << 20, 0.5f).GetBatchSize() == 1, "got %u", CFftV3(1u << 20, 0.5f).GetBatchSize());
+	CHECK(CFftV3(16, 0.5f).GetBatchSize() == CFftV3::kMaxBatchSize, "got %u", CFftV3(16, 0.5f).GetBatchSize());
+
+	std::printf("v3 equivalence with v2 (whole batches + leftovers)\n");
+	const uint32_t batches[] = { 0, 1, 3, 4, 16 };
+	const uint32_t segmentCounts[] = { 1, 2, 3, 4, 5, 15, 16, 17, 33, 64 };
+	const float overlaps[] = { 0.5f, 0.0f, 0.75f };
+	int idx = 0;
+	for (float ov : overlaps)
+	{
+		for (uint32_t batch : batches)
+		{
+			for (uint32_t segs : segmentCounts)
+			{
+				for (int reverse = 0; reverse < 2; reverse++)
+				{
+					CFftV2 v2(256, ov, reverse != 0);
+					CFftV3 v3(256, ov, reverse != 0, CFftV3::PlanEffort::Estimate, batch);
+					// Some extra samples that don't make a full segment
+					const uint32_t len = 256 + (segs - 1) * v2.GetStride() + 7;
+					auto in = Noise(len, 500 + idx);
+					std::vector<float> a, b;
+					v2.Compute(in, a, 1.0f, 100);
+					v3.Compute(in, b, 1.0f, 100);
+					float maxDiff = 0.0f;
+					for (size_t i = 0; i < a.size(); i++)
+					{
+						maxDiff = std::max(maxDiff, std::fabs(a[i] - b[i]));
+					}
+					CHECK(maxDiff < 1e-3f, "ov=%g batch=%u segs=%u rev=%d: diff %g dB", ov, batch, segs, reverse, maxDiff);
+					idx++;
+				}
+			}
+		}
+	}
+
+	// Larger sizes, Measure planning, and the tone check
+	for (uint32_t N : { 4096u, 65536u })
+	{
+		CFftV2 v2(N, 0.5f);
+		CFftV3 v3(N, 0.5f, false, CFftV3::PlanEffort::Measure, 3);
+		auto in = Noise(N * 6, N);
+		std::vector<float> a, b;
+		v2.Compute(in, a);
+		v3.Compute(in, b);
+		float maxDiff = 0.0f;
+		for (size_t i = 0; i < a.size(); i++)
+		{
+			maxDiff = std::max(maxDiff, std::fabs(a[i] - b[i]));
+		}
+		CHECK(maxDiff < 1e-3f, "N=%u measure: diff %g dB", N, maxDiff);
+	}
+	{
+		CFftV3 f(1024, 0.5f);
+		auto in = Tone(1024 * 20, 100.0 / 1024, 1.0f);
+		std::vector<float> out;
+		f.Compute(in, out);
+		const auto peak = std::max_element(out.begin(), out.end()) - out.begin();
+		CHECK(peak == 512 + 100 && std::fabs(out[peak]) < 0.01f, "peak %ld at %g dB", static_cast<long>(peak), out[peak]);
+		// Leftover state from a big call must not leak into a small one
+		std::vector<float> r1, r2;
+		auto small = Noise(1024, 9);
+		f.Compute(small, r1);
+		f.Compute(in, out);
+		f.Compute(small, r2);
+		CHECK(r1 == r2, "same input should give bit-identical output");
+	}
+}
 } // namespace
 
 int main()
@@ -265,6 +354,7 @@ int main()
 	TestTone();
 	TestEquivalenceWithV1();
 	TestRepeatedCallsIndependent();
+	TestV3();
 	std::printf("\n%d/%d checks passed\n", gChecks - gFailures, gChecks);
 	return gFailures == 0 ? 0 : 1;
 }

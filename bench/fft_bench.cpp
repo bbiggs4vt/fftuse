@@ -17,6 +17,7 @@
 #include "stdafx.h"
 #include "Fft.h"
 #include "FftV2.h"
+#include "FftV3.h"
 
 #include <algorithm>
 #include <chrono>
@@ -71,6 +72,17 @@ std::vector<Impl> Implementations()
 		{ "v2", [](uint32_t n, float ov) { return std::unique_ptr<IRunner>(new Runner<CFftV2>(n, ov)); } },
 		{ "v2-measure", [](uint32_t n, float ov) {
 			 return std::unique_ptr<IRunner>(new Runner<CFftV2>(n, ov, false, CFftV2::PlanEffort::Measure));
+		 } },
+		// v3: batched segments. "v3" picks the batch size automatically (~256 KB buffer).
+		{ "v3", [](uint32_t n, float ov) { return std::unique_ptr<IRunner>(new Runner<CFftV3>(n, ov)); } },
+		{ "v3-b4", [](uint32_t n, float ov) {
+			 return std::unique_ptr<IRunner>(new Runner<CFftV3>(n, ov, false, CFftV3::PlanEffort::Estimate, 4));
+		 } },
+		{ "v3-b16", [](uint32_t n, float ov) {
+			 return std::unique_ptr<IRunner>(new Runner<CFftV3>(n, ov, false, CFftV3::PlanEffort::Estimate, 16));
+		 } },
+		{ "v3-measure", [](uint32_t n, float ov) {
+			 return std::unique_ptr<IRunner>(new Runner<CFftV3>(n, ov, false, CFftV3::PlanEffort::Measure));
 		 } },
 	};
 }
