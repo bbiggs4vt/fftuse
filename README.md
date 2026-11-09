@@ -25,6 +25,7 @@ cmake --build build -j
 ./build/v1_bug_repro    # runs each reported bug against v1 and v2 (ASan/UBSan, Linux/macOS)
 ./build/fft_bench       # performance
 ./build/fft_wisdom -o fftwf.wisdom   # generate FFTW wisdom for this machine
+./build/fft_plan_check  # does FFTW_MEASURE pick good plans on this machine?
 bench/collect.sh --name <machine>   # everything above, packed into one archive to share
 ```
 
@@ -178,9 +179,45 @@ for armhf):
 QEMU doesn't model the A8's unpipelined FPU, so emulated timings say nothing about
 the speedup. That needs your board.
 
-Running `collect.sh` on an A8 is slow. Start with `--quick` and `--sizes` set to
-the FFT sizes your application uses, for example
-`bench/collect.sh --name a8 --quick --sizes 1024,4096`.
+Running `collect.sh` on an A8 or A9 is slow. Start with `--quick` and `--sizes`
+set to the FFT sizes your application uses, for example
+`bench/collect.sh --name a9 --quick --sizes 1024,4096`.
+
+### Results on a Cortex-A9 (Arria 10 SoC)
+
+These come from `bench/collect.sh --quick --sizes 1024,4096` on a dual-core
+Cortex-A9 with NEON, running Linux 5.4, GCC 13.3 and FFTW 3.3.10 built with NEON.
+They are the `machine` = `a9` rows in `bench/results.csv`. The board reports no
+cpufreq or thermal data, so its clock appears fixed. v1's time varied 1–4% between
+runs. Both builds pass all 758 test checks on the board.
+
+Microseconds per call (32 segments, 50% overlap), with FFTW_ESTIMATE plans and no
+wisdom:
+
+| N | v1 | v2 | v4, default flags | v4, `FFT_ARMV7_NEON=ON` | best vs v1 |
+|---|---|---|---|---|---|
+| 1024 | 4249 | 4348 | 3919 | **3233** | 1.31x |
+| 4096 | 21128 | 20781 | 19886 | **17053** | 1.24x |
+
+* **The NEON kernels are the main gain here.** They make v4 1.17–1.21x faster than
+  the same code built with the toolchain's default flags.
+* **v2 is no faster than v1 on this CPU.** The per-call allocations and extra pass
+  it removed are small next to the FFT. Its bug fixes cost nothing.
+* **Throughput.** At best, one core handles about 5.2 M input samples/s at N=1024
+  and 4.0 M at N=4096. The second core can run another `CFftV4` on another thread.
+* **FFTW_MEASURE and wisdom made things slower on this board.** Every version got
+  slower with them:
+
+  | v4, `FFT_ARMV7_NEON=ON` | N=1024 | N=4096 |
+  |---|---|---|
+  | `PlanEffort::Estimate` | 3233 us | 17053 us |
+  | `PlanEffort::Measure` | 4137 us (1.28x) | 21837 us (1.28x) |
+  | Estimate with a wisdom file loaded | 4411 us (1.36x) | 21327 us (1.25x) |
+
+  So on this board, use `PlanEffort::Estimate`, or `WisdomOrEstimate` without a
+  wisdom file, and don't ship wisdom files. FFTW's measured plans do use NEON
+  codelets (`n1fv_*_neon`, `t2fv_*_neon`), so this isn't a fall-back to scalar code.
+  `tools/fft_plan_check` (below) tells apart the two likely causes.
 
 ## Behavior changes in v2
 
@@ -301,6 +338,45 @@ back in. Clang vectorizes it either way. MSVC hasn't been checked.
 Wisdom is FFTW's record of which algorithms ran fastest on this machine. With it
 loaded, `PlanEffort::Measure` costs nothing at construction time.
 
+**First check that Measure helps on your machine.** On the x86 VM, Measure plans
+are 1.05–1.5x faster than Estimate plans. On the Cortex-A9 they are about 1.28x
+*slower* (see the A9 results above). Measure plans, and wisdom made from them, are
+only worth using where `fft_bench` shows `v4-measure` beating `v4`.
+
+### Does FFTW_MEASURE pick good plans here? `tools/fft_plan_check`
+
+```
+./build/fft_plan_check                       # sizes 1024,4096
+./build/fft_plan_check --sizes 256,1024 --measure-runs 5 --details
+```
+
+For each size and plan layout (CFftV4's out-of-place, CFftV2's in-place), it builds
+one Estimate plan and several Measure plans, clearing wisdom before each. It then
+times every plan two ways:
+
+* **Isolated:** the transform alone, run repeatedly. This is how FFTW times
+  candidates while it plans.
+* **In situ:** inside the same per-segment loop as `CFftV4::Compute`, with window,
+  transform and accumulate, using the build's kernels.
+
+The verdict tells apart two causes of slow measured plans:
+
+* **Bad measurements:** the Measure plan is slower even when timed on its own, or
+  Measure picks different plans from run to run while losing in situ. This usually
+  means FFTW has no cycle counter on the CPU and times candidates with a coarse
+  clock. On ARMv7, FFTW only uses a cycle counter if it was configured with
+  `--enable-armv7a-cntvct` or `--enable-armv7a-pmccntr`, and both need kernel
+  support. (The Cortex-A9 has no generic timer, so only the PMU option applies.)
+* **Cache interaction:** the Measure plan wins on its own but loses in the real
+  loop, because FFTW's isolated timing doesn't see the window and accumulate
+  passes competing for cache.
+
+`--details` prints FFTW's description of every plan. `bench/collect.sh` runs the
+check for each build variant and saves it as `plan-check-<variant>.txt`.
+
+On the x86 VM, Measure plans take 0.69–0.83x of the Estimate plan's time isolated
+and 0.82–0.95x in situ, so Measure helps there.
+
 ### Using it
 
 Load the wisdom once at startup, before creating any FFT objects:
@@ -410,6 +486,8 @@ cold rows. Compare absolute times across rows instead.
 
 ### Next ideas
 
-* The FFT is now 70–80% of the time and runs with measured plans, so the remaining
-  levers are application-level: less overlap, fewer segments, or a smaller FFT where
-  resolution allows.
+* On x86, the FFT is now 70–80% of the time and runs with measured plans, so the
+  remaining levers are application-level: less overlap, fewer segments, or a
+  smaller FFT where resolution allows.
+* On the Cortex-A9, find out why Measure loses (`fft_plan_check`), and try tuning
+  the whole build for the CPU (`CMAKE_ARGS="-DCMAKE_CXX_FLAGS=-mcpu=cortex-a9"`).

@@ -63,6 +63,9 @@ target_compile_definitions(fft_bench PRIVATE
 add_executable(fft_wisdom tools/fft_wisdom.cpp)
 target_link_libraries(fft_wisdom PRIVATE fftlib)
 
+add_executable(fft_plan_check tools/fft_plan_check.cpp)
+target_link_libraries(fft_plan_check PRIVATE fftlib)
+
 enable_testing()
 add_test(NAME fft_tests COMMAND fft_tests)
 
