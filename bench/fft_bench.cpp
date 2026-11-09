@@ -11,6 +11,8 @@
 //   ./fft_bench --sizes 1024,8192 --segments 64 --overlap 0.75 --min-time 200
 //   ./fft_bench --only v2,v4             # just these (v1 always runs as the baseline)
 //   ./fft_bench --only "v4*"             # v4 and v4-measure
+//   ./fft_bench --machine pi5 --csv results.csv   # name the machine in the CSV
+//   ./fft_bench --info                   # print the detected machine/build details and exit
 //   ./fft_bench --wisdom fftwf.wisdom    # construct with this wisdom loaded (warm start);
 //                                        # make it with tools/fft_wisdom
 //
@@ -23,6 +25,7 @@
 #include "FftV3.h"
 #include "FftV4.h"
 #include "FftwWisdom.h"
+#include "machine_info.h"
 
 #include <algorithm>
 #include <chrono>
@@ -30,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <random>
@@ -112,6 +116,8 @@ struct Options
 	std::string label;
 	std::string only;
 	std::string wisdomPath; // empty: every construction is cold
+	std::string machine;    // label for this machine; host name if empty
+	bool infoOnly = false;
 };
 
 struct Result
@@ -238,7 +244,7 @@ void Usage()
 	std::printf(
 		"usage: fft_bench [--quick] [--sizes a,b,c] [--bins-div a,b] [--segments K]\n"
 		"                 [--overlap f] [--min-time ms] [--samples n] [--only a,b,prefix*]\n"
-		"                 [--csv path] [--label text] [--wisdom file]\n");
+		"                 [--csv path] [--label text] [--wisdom file] [--machine name] [--info]\n");
 }
 
 bool ParseArgs(int argc, char** argv, Options& opt)
@@ -271,6 +277,8 @@ bool ParseArgs(int argc, char** argv, Options& opt)
 		else if (a == "--csv") opt.csvPath = next();
 		else if (a == "--label") opt.label = next();
 		else if (a == "--wisdom") opt.wisdomPath = next();
+		else if (a == "--machine") opt.machine = next();
+		else if (a == "--info") opt.infoOnly = true;
 		else
 		{
 			Usage();
@@ -289,6 +297,21 @@ int main(int argc, char** argv)
 		return 2;
 	}
 
+	const MachineInfo mi = DetectMachine(opt.machine);
+	std::printf("machine:  %s\n", mi.machine.c_str());
+	std::printf("cpu:      %s (%s, %u threads, governor %s)\n", mi.cpu.c_str(), mi.arch.c_str(), mi.cores, mi.governor.c_str());
+	std::printf("compiler: %s, %s, simd %s\n", mi.compiler.c_str(), mi.build.c_str(), mi.simd.c_str());
+	std::printf("fftw:     %s\n", mi.fftw.c_str());
+	if (mi.governor != "performance" && mi.governor != "unknown")
+	{
+		std::printf("note:     CPU governor is '%s'; results vary more than with 'performance'\n", mi.governor.c_str());
+	}
+	std::printf("\n");
+	if (opt.infoOnly)
+	{
+		return 0;
+	}
+
 	if (!opt.wisdomPath.empty() && !FftwWisdom::Load(opt.wisdomPath))
 	{
 		std::printf("can't load wisdom from %s\n", opt.wisdomPath.c_str());
@@ -304,22 +327,39 @@ int main(int argc, char** argv)
 	std::vector<Impl> impls = Implementations();
 	const std::string baselineName = impls.front().name;
 
+	// Rows carry the machine and build so CSVs from different machines can be merged
+	const std::string csvHeader = "timestamp,label,impl,fft_size,bins,segments,overlap,ctor_ms,median_ns,min_ns,"
+		"ns_per_segment,msamples_per_s,speedup_vs_" + baselineName + ",max_diff_db,"
+		"machine,arch,cpu,threads,governor,compiler,build,simd,fftw";
+	const std::string machineCsv = "\"" + CsvText(mi.machine) + "\"," + mi.arch + ",\"" + CsvText(mi.cpu) + "\"," +
+		std::to_string(mi.cores) + "," + mi.governor + ",\"" + CsvText(mi.compiler) + "\",\"" + CsvText(mi.build) +
+		"\"," + mi.simd + ",\"" + CsvText(mi.fftw) + "\"";
+
 	FILE* csv = nullptr;
 	if (!opt.csvPath.empty())
 	{
-		FILE* probe = std::fopen(opt.csvPath.c_str(), "r");
-		const bool exists = probe != nullptr;
-		if (probe) std::fclose(probe);
+		std::string existingHeader;
+		{
+			std::ifstream probe(opt.csvPath);
+			if (probe)
+			{
+				std::getline(probe, existingHeader);
+			}
+		}
+		if (!existingHeader.empty() && existingHeader != csvHeader)
+		{
+			std::printf("%s has different columns (from an older fft_bench); use a new CSV file\n", opt.csvPath.c_str());
+			return 2;
+		}
 		csv = std::fopen(opt.csvPath.c_str(), "a");
 		if (!csv)
 		{
 			std::printf("can't open %s\n", opt.csvPath.c_str());
 			return 2;
 		}
-		if (!exists)
+		if (existingHeader.empty())
 		{
-			std::fprintf(csv, "timestamp,label,impl,fft_size,bins,segments,overlap,ctor_ms,median_ns,min_ns,ns_per_segment,msamples_per_s,speedup_vs_%s,max_diff_db\n",
-				baselineName.c_str());
+			std::fprintf(csv, "%s\n", csvHeader.c_str());
 		}
 	}
 	char stamp[32];
@@ -375,9 +415,9 @@ int main(int argc, char** argv)
 					r.ctorMs, r.medianNs / 1e3, nsPerSeg, msps, speedup, r.maxDiffDb);
 				if (csv)
 				{
-					std::fprintf(csv, "%s,\"%s\",%s,%u,%u,%u,%.3f,%.4f,%.1f,%.1f,%.2f,%.2f,%.4f,%.3g\n", stamp,
-						opt.label.c_str(), impl.name.c_str(), N, bins, opt.segments, opt.overlap, r.ctorMs, r.medianNs,
-						r.minNs, nsPerSeg, msps, speedup, r.maxDiffDb);
+					std::fprintf(csv, "%s,\"%s\",%s,%u,%u,%u,%.3f,%.4f,%.1f,%.1f,%.2f,%.2f,%.4f,%.3g,%s\n", stamp,
+						CsvText(opt.label).c_str(), impl.name.c_str(), N, bins, opt.segments, opt.overlap, r.ctorMs, r.medianNs,
+						r.minNs, nsPerSeg, msps, speedup, r.maxDiffDb, machineCsv.c_str());
 				}
 			}
 			std::printf("\n");

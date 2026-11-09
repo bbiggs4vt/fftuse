@@ -1,1 +1,3 @@
 build*/
+bench-results-*/
+bench-results-*.tar.gz
