@@ -75,7 +75,12 @@ script:
    `CMAKE_ARGS=-DCMAKE_PREFIX_PATH=/opt/fftw`.
 3. Runs the correctness tests (`tests.log`). They matter as much as the timings on
    a new architecture, so the script still benchmarks when they fail, but says so.
-4. Runs the v1 bug repro if the toolchain supports sanitizers.
+4. Runs the v1 bug repro if the toolchain supports sanitizers. This step is
+   informational. Each scenario is killed after 30 seconds (`FFT_REPRO_TIMEOUT`)
+   and reported as `HANG`. On ARM, v1 with `overlap = 1` hangs rather than
+   returning garbage: its segment count is +inf converted to `uint32_t`, which
+   saturates to 4294967295 on ARM but becomes 0 on x86. v1 then runs about 4.3
+   billion FFTs.
 5. Generates FFTW wisdom for this machine.
 6. Benchmarks every version twice, without and with the wisdom, into one
    `results.csv`.
