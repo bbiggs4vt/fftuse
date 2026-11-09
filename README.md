@@ -201,9 +201,12 @@ set to the FFT sizes your application uses, for example
 
 ### Results on a Cortex-A9 (Arria 10 SoC)
 
-These come from `bench/collect.sh --quick --sizes 1024,4096` on a dual-core
+These come from two runs of `bench/collect.sh --quick --sizes 1024,4096` on a dual-core
 Cortex-A9 with NEON, running Linux 5.4, GCC 13.3 and FFTW 3.3.10 built with NEON.
-They are the `machine` = `a9` rows in `bench/results.csv`. The board reports no
+They are the `machine` = `a9` rows in `bench/results.csv`. The tables show the
+first run. The second, which added the plan check, came within about 2% for the
+recommended setup (v4 with NEON kernels and Estimate planning), and the median
+row moved 1.4%. The board reports no
 cpufreq or thermal data, so its clock appears fixed. v1's time varied 1–4% between
 runs. Both builds pass all 758 test checks on the board.
 
@@ -246,11 +249,24 @@ wisdom:
   caches, which on a 32 KB L1 and slow memory keeps favoring the table-heavy
   pieces.
 
-  The board's FFTW comes from Yocto's recipe, configured with
-  `--enable-shared --enable-threads --disable-fortran` (plus the single-precision
-  and NEON options, as `fftw-3.3.10-neon` shows) and built with `-O2 -mcpu=cortex-a9
-  -mfpu=neon`. It has no cycle counter (`--enable-armv7a-pmccntr`), so FFTW times
-  candidates with a coarse clock. On its own, a coarse clock would more likely give
+  The board's FFTW 3.3.10 comes from Yocto's recipe, which configures it once
+  per precision. All three runs share
+  `--disable-fortran --enable-shared --enable-threads --disable-static`, plus
+  Yocto's usual cross-compile and install-path options:
+
+  | Library | Extra configure options | Used here? |
+  |---|---|---|
+  | `libfftw3` (double) | none | no |
+  | `libfftw3l` (long double) | `--enable-long-double` | no |
+  | `libfftw3f` (single) | `--enable-single --enable-neon` | yes: every `CFft` version calls `fftwf_*` |
+
+  It was compiled with `-mfpu=neon -mfloat-abi=hard -mcpu=cortex-a9
+  -fstack-protector-strong -O2 -D_FORTIFY_SOURCE=2`. Note `-O2`, not FFTW's usual
+  `-O3`; its effect here hasn't been measured. None of the runs enables a cycle
+  counter (`--enable-armv7a-pmccntr`), so FFTW times candidates with a coarse clock.
+  `--enable-threads` also built `libfftw3f_threads`, whose
+  `fftwf_make_planner_thread_safe()` could replace `CFftwPlanLock`. Nothing here
+  needs it. On its own, a coarse clock would more likely give
   noisy picks than this consistent one. Adding the counter would also need kernel
   support for user-space PMU access, so it isn't worth pursuing: use Estimate.
   To check another FFTW library for the cycle counter:
