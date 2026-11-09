@@ -9,7 +9,8 @@
 //   ./fft_bench --quick                  # smaller grid, shorter runs
 //   ./fft_bench --csv results.csv --label "v2 first pass"
 //   ./fft_bench --sizes 1024,8192 --segments 64 --overlap 0.75 --min-time 200
-//   ./fft_bench --only v2                # run implementations whose name contains "v2"
+//   ./fft_bench --only v2,v4             # just these (v1 always runs as the baseline)
+//   ./fft_bench --only "v4*"             # v4 and v4-measure
 //
 // To add a new version (e.g. CFftV3), include its header and add a line to
 // Implementations() below.
@@ -18,6 +19,7 @@
 #include "Fft.h"
 #include "FftV2.h"
 #include "FftV3.h"
+#include "FftV4.h"
 
 #include <algorithm>
 #include <chrono>
@@ -83,6 +85,11 @@ std::vector<Impl> Implementations()
 		 } },
 		{ "v3-measure", [](uint32_t n, float ov) {
 			 return std::unique_ptr<IRunner>(new Runner<CFftV3>(n, ov, false, CFftV3::PlanEffort::Measure));
+		 } },
+		// v4: out-of-place FFT, float-wise window, vectorized fast dB
+		{ "v4", [](uint32_t n, float ov) { return std::unique_ptr<IRunner>(new Runner<CFftV4>(n, ov)); } },
+		{ "v4-measure", [](uint32_t n, float ov) {
+			 return std::unique_ptr<IRunner>(new Runner<CFftV4>(n, ov, false, CFftV4::PlanEffort::Measure));
 		 } },
 	};
 }
@@ -178,6 +185,33 @@ Result Measure(const Impl& impl, const Options& opt, uint32_t requestedSize, uin
 	return r;
 }
 
+/// --only takes a comma-separated list. An entry matches a name exactly, or as a
+/// prefix when it ends in '*' (e.g. "v4*" selects v4 and v4-measure).
+bool Selected(const std::string& name, const std::string& only)
+{
+	if (only.empty())
+	{
+		return true;
+	}
+	std::stringstream ss(only);
+	std::string tok;
+	while (std::getline(ss, tok, ','))
+	{
+		if (!tok.empty() && tok.back() == '*')
+		{
+			if (name.compare(0, tok.size() - 1, tok, 0, tok.size() - 1) == 0)
+			{
+				return true;
+			}
+		}
+		else if (name == tok)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 std::vector<uint32_t> ParseList(const char* s)
 {
 	std::vector<uint32_t> v;
@@ -194,7 +228,7 @@ void Usage()
 {
 	std::printf(
 		"usage: fft_bench [--quick] [--sizes a,b,c] [--bins-div a,b] [--segments K]\n"
-		"                 [--overlap f] [--min-time ms] [--samples n] [--only substr]\n"
+		"                 [--overlap f] [--min-time ms] [--samples n] [--only a,b,prefix*]\n"
 		"                 [--csv path] [--label text]\n");
 }
 
@@ -292,7 +326,7 @@ int main(int argc, char** argv)
 			{
 				const Impl& impl = impls[i];
 				const bool isBaseline = (i == 0);
-				if (!isBaseline && !opt.only.empty() && impl.name.find(opt.only) == std::string::npos)
+				if (!isBaseline && !Selected(impl.name, opt.only))
 				{
 					continue;
 				}

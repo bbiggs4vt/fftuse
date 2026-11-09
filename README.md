@@ -1,9 +1,14 @@
 # fftuse
 
-`Fft.h` / `Fft.cpp` are the original `CFft`, left untouched. `FftV2.h` / `FftV2.cpp`
-hold `CFftV2`, which has the fixes. `FftV3.h` / `FftV3.cpp` hold `CFftV3`, an
-experiment that batches segments with `fftwf_plan_many_dft` (results below). All
-three build side by side so they can be tested and benchmarked against each other.
+| File | Class | What it is |
+|---|---|---|
+| `Fft.h` / `Fft.cpp` | `CFft` | The original, untouched |
+| `FftV2.h` / `FftV2.cpp` | `CFftV2` | Bug fixes and the first speedups |
+| `FftV3.h` / `FftV3.cpp` | `CFftV3` | Experiment: batched segments with `fftwf_plan_many_dft`. Not faster; kept for the record |
+| `FftV4.h` / `FftV4.cpp` | `CFftV4` | Fastest: out-of-place FFT and vectorized dB conversion. Use this one |
+
+All four build side by side so they can be tested and benchmarked against each
+other. v2, v3 and v4 share the same interface and behavior.
 
 ## Build
 
@@ -28,8 +33,12 @@ them on the include path in place of `compat/`.
 ```
 ./build/fft_bench --quick                                    # fast check
 ./build/fft_bench --csv bench/results.csv --label "what changed"
-./build/fft_bench --sizes 2048,8192 --segments 64 --overlap 0.75 --only v2
+./build/fft_bench --sizes 2048,8192 --segments 64 --overlap 0.75 --only v2,v4
+./build/fft_bench --only "v4*"                               # v4 and v4-measure
 ```
+
+Compare versions within one run (`--only a,b`), because run-to-run noise on a shared
+machine is 5–10%.
 
 For each FFT size and output-bin count, it reports the constructor time (FFTW
 wisdom is cleared first, so every construction is cold), the median time per
@@ -92,22 +101,73 @@ Why it doesn't help:
 
 `FFTW_MEASURE` gives more than batching does, on v2 or v3.
 
-### Where the time goes (v2, per segment, measured separately)
+### Where the time goes (v2, per segment, -O3)
+
+An earlier version of this table was measured at -O2, where GCC 13 doesn't vectorize
+the window and accumulate loops. That overstated them (35–50%). At the -O3 Release
+build:
 
 | N | window | FFT | accumulate | dB conversion |
 |---|---|---|---|---|
-| 256–4096 | ~20–24% | 36–51% | ~20–29% | ~9–13% |
-| 16384–65536 | ~15–21% | 52–66% | ~12–19% | ~5–8% |
+| 256–4096 | 12–15% | 62–67% | 8–13% | 12–14% |
+| 16384–65536 | 8–18% | 74–80% | 4–5% | 5–7% |
 
-The window and accumulate loops are 35–50% of the time at small and mid N, so they
-are the next thing to speed up, not the FFT calls. Ideas for v4, each checkable with
-`fft_bench`:
+The FFT dominates, and building with AVX2 (`-mavx2 -mfma`) doesn't change that.
 
-* Treat the buffers as interleaved float arrays, with the window duplicated per
-  real/imag pair, so the compiler can use SIMD. Try `-march=native` or AVX2.
-* Accumulate straight from the FFTW output without a separate pass over memory, for
-  example with FFTW's split real/imag guru interface.
-* Use a fast `log10` approximation for the dB conversion, if about 0.01 dB of error
-  is acceptable.
-* Use FFTW wisdom files so MEASURE plans are computed once rather than in every
-  process.
+## v4: out-of-place FFT and vectorized dB conversion
+
+`CFftV4` is `CFftV2` with two changes, and its output still matches v2:
+
+* **Out-of-place FFT.** FFTW reads from one buffer and writes to a second, with
+  `FFTW_DESTROY_INPUT`. That flag is free because the input buffer is rewritten for
+  every segment. FFTW picks faster algorithms out-of-place, and `FFTW_MEASURE`
+  planning takes about half as long.
+* **Vectorized fast dB conversion.** The fftshift reads two contiguous runs, not a
+  masked index per bin, and `log10` is replaced by a polynomial `log2` that is exact
+  to about 1e-5 dB. This kernel is 4.3x faster than the `std::log10` loop. Power
+  below FLT_MIN (-379 dB, before the shift) reads as -379 dB. Zero, NaN and
+  infinite power behave as in v2.
+
+With 32 segments per call (recorded in `bench/results.csv` with the label "v4 ..."):
+
+| N | v4 vs v2 | v4-measure vs v2-measure | v4-measure vs v1 | Measure constructor |
+|---|---|---|---|---|
+| 256 | 1.4–1.7x | 1.15–1.45x | 2.2x | 40 ms (v2: 77 ms) |
+| 1024 | 1.25–1.5x | 1.1–1.35x | 1.9x | 75 ms (v2: 150 ms) |
+| 4096 | 1.15–1.3x | 1.1–1.25x | 1.8–1.9x | 122 ms (v2: 250 ms) |
+| 16384 | 1.05–1.15x | 1.1–1.25x | 1.9x | 255 ms (v2: 490 ms) |
+| 65536 | 1.05–1.2x | 1.05–1.15x | 1.4–1.5x | 860 ms (v2: 1580 ms) |
+
+The ranges cover the recorded run and two more same-run comparisons.
+
+### What didn't work (measured, then dropped)
+
+* **Interleaved float loops.** These treat the buffers as `re, im, re, im` floats,
+  with the window stored twice per sample. The window loop was no faster, and the
+  accumulate loop (`re*re + im*im` at stride 2) was about 4x slower than
+  `std::norm` over `std::complex<float>`, because GCC vectorizes the complex form
+  better. Including it made v4 10–30% slower than v2, so v4 keeps v2's complex
+  loops. The comment on `AccumulatePower` records this.
+* **AVX2 build flags.** No measurable change. FFTW picks its own SIMD at run time.
+
+### Vectorization notes
+
+GCC's default `-ftrapping-math` stops it from vectorizing a loop with a conditional
+float op, and it creates those itself: it moves work into one arm of a `?:`, or
+threads a branch around a constant case. `FastDb` avoids that in three ways:
+
+* It uses only integer ops for the range reduction.
+* It clamps with an integer `max` on the bits.
+* `ConvertToDb` runs two passes: the log math first, then the selects.
+
+`g++ -O3 -fopt-info-vec-missed -c FftV4.cpp` should report every kernel loop as
+vectorized. If a loop shows "control flow in loop", one of these patterns has crept
+back in. Clang vectorizes it either way. MSVC hasn't been checked.
+
+### Next ideas
+
+* Save FFTW wisdom to a file (`fftwf_export_wisdom_to_filename`), so the Measure
+  constructor cost is paid once per machine, not once per process. Measure gives v4
+  another 1.05–1.5x.
+* The FFT is now 70–80% of the time. Beyond Measure planning, the remaining lever is
+  doing fewer transforms, for example less overlap if the application allows it.

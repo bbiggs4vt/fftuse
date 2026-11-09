@@ -5,6 +5,7 @@
 #include "Fft.h"
 #include "FftV2.h"
 #include "FftV3.h"
+#include "FftV4.h"
 
 #include <cfloat>
 #include <cstdio>
@@ -343,6 +344,127 @@ void TestV3()
 		CHECK(r1 == r2, "same input should give bit-identical output");
 	}
 }
+float MaxDiff(const std::vector<float>& a, const std::vector<float>& b)
+{
+	float d = (a.size() == b.size()) ? 0.0f : 1e30f;
+	for (size_t i = 0; i < a.size() && i < b.size(); i++)
+	{
+		d = std::max(d, std::fabs(a[i] - b[i]));
+	}
+	return d;
+}
+
+void TestV4()
+{
+	std::printf("v4 validation\n");
+	CHECK(!std::is_copy_constructible<CFftV4>::value, "CFftV4 must not be copyable");
+	CHECK(Throws<std::invalid_argument>([] { CFftV4 f(0, 0.5f); }), "fftSize 0");
+	CHECK(Throws<std::invalid_argument>([] { CFftV4 f(1024, 1.0f); }), "overlap 1");
+	CHECK(Throws<std::invalid_argument>([] { CFftV4 f(1024, std::nanf("")); }), "overlap NaN");
+	{
+		CFftV4 f(1024, 0.5f);
+		std::vector<float> out(1024);
+		auto in = Noise(1000, 1);
+		CHECK(Throws<std::invalid_argument>([&] { f.Compute(in.data(), 1000, out.data()); }), "short input");
+		auto ok = Noise(4096, 2);
+		CHECK(Throws<std::invalid_argument>([&] { f.Compute(ok.data(), 4096, out.data(), 0.0f, 1025); }), "bins > N");
+		CHECK(Throws<std::invalid_argument>([&] { f.Compute(nullptr, 4096, out.data()); }), "null input");
+		std::vector<float> v;
+		f.Compute(ok, v, 0.0f, 10);
+		CHECK(v.size() == 10, "got %zu", v.size());
+		std::vector<std::complex<float>> empty;
+		CHECK(Throws<std::invalid_argument>([&] { f.Compute(empty, v); }), "empty vector input");
+	}
+
+	std::printf("v4 equivalence with v2\n");
+	// Every bins value hits a different split of the fftshift into two runs
+	const uint32_t sizes[] = { 2, 4, 64, 256, 1000, 4096, 65536 };
+	const float overlaps[] = { 0.5f, 0.0f, 0.75f };
+	int idx = 0;
+	for (uint32_t size : sizes)
+	{
+		for (float ov : overlaps)
+		{
+			for (int reverse = 0; reverse < 2; reverse++)
+			{
+				CFftV2 v2(size, ov, reverse != 0);
+				CFftV4 v4(size, ov, reverse != 0);
+				const uint32_t N = v2.GetFftSize();
+				auto in = Noise(N * 3 + 5, 900 + idx++);
+				const uint32_t binChoices[] = { 0, 1, 2, 3, N / 2, N / 2 + 1, N - 1, N };
+				for (uint32_t bins : binChoices)
+				{
+					if (bins > N)
+					{
+						continue;
+					}
+					std::vector<float> a, b;
+					v2.Compute(in, a, -4.0f, bins);
+					v4.Compute(in, b, -4.0f, bins);
+					const float d = MaxDiff(a, b);
+					CHECK(d < 1e-3f, "N=%u ov=%g rev=%d bins=%u: diff %g dB", N, ov, reverse, bins, d);
+				}
+			}
+		}
+	}
+
+	std::printf("v4 fast log across 60 decades of power\n");
+	{
+		CFftV2 v2(512, 0.5f);
+		CFftV4 v4(512, 0.5f);
+		auto base = Noise(512 * 4, 77);
+		float worst = 0.0f;
+		for (int decade = -15; decade <= 15; decade++)
+		{
+			const float scale = std::pow(10.0f, static_cast<float>(decade));
+			std::vector<std::complex<float>> in(base.size());
+			for (size_t i = 0; i < in.size(); i++)
+			{
+				in[i] = base[i] * scale;
+			}
+			std::vector<float> a, b;
+			v2.Compute(in, a);
+			v4.Compute(in, b);
+			worst = std::max(worst, MaxDiff(a, b));
+		}
+		CHECK(worst < 1e-3f, "worst diff %g dB", worst);
+	}
+
+	std::printf("v4 special values\n");
+	{
+		CFftV4 f(256, 0.5f);
+		std::vector<std::complex<float>> zeros(1024);
+		std::vector<float> out;
+		f.Compute(zeros, out);
+		CHECK(*std::max_element(out.begin(), out.end()) == CFftV4::kDefaultFloorDb, "zeros -> floor");
+		// A big shift must not lift empty bins above the floor
+		f.Compute(zeros, out, 500.0f);
+		CHECK(*std::max_element(out.begin(), out.end()) == CFftV4::kDefaultFloorDb, "zeros + shift -> floor, got %g", out[0]);
+		f.SetFloorDb(-150.0f);
+		f.Compute(zeros, out);
+		CHECK(out[3] == -150.0f, "custom floor, got %g", out[3]);
+
+		CFftV2 g2(256, 0.5f);
+		CFftV4 g4(256, 0.5f);
+		std::vector<std::complex<float>> nan(1024, { std::nanf(""), 0.0f });
+		std::vector<float> a, b;
+		g2.Compute(nan, a);
+		g4.Compute(nan, b);
+		CHECK(a == b, "NaN input should match v2 (floor)");
+		std::vector<std::complex<float>> huge(1024, { 3e38f, 3e38f });
+		g2.Compute(huge, a);
+		g4.Compute(huge, b);
+		CHECK(a == b, "overflowing input should match v2 (FLT_MAX), %g vs %g", a[128], b[128]);
+	}
+	{
+		CFftV4 f(1024, 0.5f, false, CFftV4::PlanEffort::Measure);
+		auto in = Tone(1024 * 8, 100.0 / 1024, 1.0f);
+		std::vector<float> out;
+		f.Compute(in, out);
+		const auto peak = std::max_element(out.begin(), out.end()) - out.begin();
+		CHECK(peak == 512 + 100 && std::fabs(out[peak]) < 0.01f, "peak %ld at %g dB", static_cast<long>(peak), out[peak]);
+	}
+}
 } // namespace
 
 int main()
@@ -355,6 +477,7 @@ int main()
 	TestEquivalenceWithV1();
 	TestRepeatedCallsIndependent();
 	TestV3();
+	TestV4();
 	std::printf("\n%d/%d checks passed\n", gChecks - gFailures, gChecks);
 	return gFailures == 0 ? 0 : 1;
 }
