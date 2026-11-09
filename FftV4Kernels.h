@@ -18,9 +18,16 @@
 // distro builds) uses its "very cheap" vectorizer cost model, which leaves all
 // four loops scalar. Build this file with -O3, or add
 //     -ftree-vectorize -fvect-cost-model=dynamic
-// (CMake does this automatically). So a Yocto build for a Cortex-A9, whose
-// tune already supplies -mfpu=neon, needs for this file:
-//     -funsafe-math-optimizations -ftree-vectorize -fvect-cost-model=dynamic
+// (CMake does this automatically).
+//
+// Link-time optimization (-flto) undoes all of the above: the kernels are
+// inlined into callers built without these flags and run scalar (measured
+// about 1.5x slower for CFftV4 on x86). Build this file with -fno-lto; CMake
+// does that too.
+//
+// So a Yocto build for a Cortex-A9, whose tune already supplies -mfpu=neon,
+// needs for this file:
+//     -funsafe-math-optimizations -ftree-vectorize -fvect-cost-model=dynamic -fno-lto
 //
 // On x86-64 and AArch64, -O3 (or the two vectorizer flags) is all these loops need.
 //

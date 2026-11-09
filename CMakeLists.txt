@@ -38,6 +38,10 @@ endif()
 # the latter. The resulting binary needs a CPU with NEON.
 include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag("-ftree-vectorize -fvect-cost-model=dynamic" FFT_HAVE_VECT_COST_MODEL)
+# With link-time optimization (-flto, e.g. CMAKE_INTERPROCEDURAL_OPTIMIZATION),
+# the kernels are inlined into callers built without the flags below and end up
+# scalar. -fno-lto keeps them as separate, vectorized functions.
+check_cxx_compiler_flag("-fno-lto" FFT_HAVE_NO_LTO)
 option(FFT_ARMV7_NEON "Build CFftV4's kernels with -mfpu=neon -funsafe-math-optimizations (32-bit ARM)" OFF)
 set(FFT_V4_KERNEL_FLAGS "")
 if(FFT_HAVE_VECT_COST_MODEL)
@@ -45,6 +49,9 @@ if(FFT_HAVE_VECT_COST_MODEL)
 endif()
 if(FFT_ARMV7_NEON)
   list(APPEND FFT_V4_KERNEL_FLAGS -mfpu=neon -funsafe-math-optimizations)
+endif()
+if(FFT_HAVE_NO_LTO)
+  list(APPEND FFT_V4_KERNEL_FLAGS -fno-lto)
 endif()
 if(FFT_V4_KERNEL_FLAGS)
   set_source_files_properties(FftV4Kernels.cpp PROPERTIES COMPILE_OPTIONS "${FFT_V4_KERNEL_FLAGS}")
